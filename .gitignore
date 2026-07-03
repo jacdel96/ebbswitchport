@@ -12,3 +12,4 @@ title.keys
 
 # OS noise
 .DS_Store
+.venv/

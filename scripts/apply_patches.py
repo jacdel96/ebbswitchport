@@ -17,8 +17,9 @@ REPO = Path(__file__).resolve().parent.parent
 PATCHES = REPO / "patches"
 ROMS = REPO / "roms"
 
-# EarthBound (USA), headerless
-EXPECTED_BASE_CRC = 0x31C99B0A
+# EarthBound (USA), headerless — the standard base ROM both patches declare
+# in their BPS footers (also the base used across the EB hacking community).
+EXPECTED_BASE_CRC = 0xDC9BB451
 
 SOURCE_READ, TARGET_READ, SOURCE_COPY, TARGET_COPY = range(4)
 
