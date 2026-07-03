@@ -13,9 +13,11 @@ if [[ -x "$TOOLS/bin/hacbrewpack" ]]; then
 fi
 
 if [[ ! -d "$TOOLS/hacBrewPack" ]]; then
-    git clone --depth 1 https://github.com/The-4n/hacBrewPack "$TOOLS/hacBrewPack"
+    # The-4n's original repo is gone; this fork is a pristine mirror at final v3.05.
+    git clone --depth 1 --branch v3.05 https://github.com/dragonflylee/hacBrewPack "$TOOLS/hacBrewPack"
 fi
 
+[[ -f "$TOOLS/hacBrewPack/config.mk" ]] || cp "$TOOLS/hacBrewPack/config.mk.template" "$TOOLS/hacBrewPack/config.mk"
 make -C "$TOOLS/hacBrewPack"
 mkdir -p "$TOOLS/bin"
 cp "$TOOLS/hacBrewPack/hacbrewpack" "$TOOLS/bin/hacbrewpack"
