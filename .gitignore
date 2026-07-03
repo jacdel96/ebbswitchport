@@ -1,0 +1,14 @@
+# Nintendo-copyrighted content and console secrets — NEVER commit these
+roms/
+keys/
+out/
+sd-stage/
+*.sfc
+*.smc
+*.nsp
+*.nro
+prod.keys
+title.keys
+
+# OS noise
+.DS_Store
