@@ -13,3 +13,4 @@ title.keys
 # OS noise
 .DS_Store
 .venv/
+__pycache__/
