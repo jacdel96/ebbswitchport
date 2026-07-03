@@ -54,7 +54,7 @@ Title IDs are pinned in `build_forwarders.py` — do not change them once instal
 
 ### Path A — install the prebuilt NSPs
 
-Prereq: signature patches (sigpatches) matching your Atmosphere/firmware version, since forwarder NSPs are unsigned homebrew. If DBI reports an install/launch signature error, update sigpatches first (search "sigpatches" for your Atmosphere version; they go in `/atmosphere/` + `/bootloader/patches/`).
+Prereq: **signature patches (sigpatches)**, since forwarder NSPs are unsigned homebrew. Without them, launching a forwarder throws `fsOpenFileSystemWithId()`. This repo stages [**sys-patch**](https://github.com/impeeza/sys-patch) into `sd-stage/atmosphere/` — a sysmodule that applies the patches at runtime and auto-adapts across firmware updates (no version-matched zip to chase). `deploy_sd.sh` copies it. After deploying, reboot the console once so the sysmodule loads (check the `sys-patch` overlay via Tesla, or just confirm forwarders now launch). Requires booting Atmosphere via hekate or an IPS-capable fusee. If you'd rather use static patches, the GBAtemp "Sigpatches for Atmosphere" thread publishes per-version bundles that extract over the SD root instead.
 
 1. On the Switch, open **DBI** (or Goldleaf) from the Homebrew Menu.
 2. *Browse SD* → `/nsp/` → install each of the three NSPs to the SD card.

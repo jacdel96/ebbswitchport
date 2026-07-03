@@ -30,6 +30,8 @@ echo "==> RetroArch + cores"
 rsync -rt --progress "$REPO/sd-stage/retroarch/" "$SD/retroarch/"
 rsync -rt "$REPO/sd-stage/switch/" "$SD/switch/"
 [[ -d "$REPO/sd-stage/bootloader" ]] && rsync -rt "$REPO/sd-stage/bootloader/" "$SD/bootloader/"
+# sys-patch sysmodule + overlay (adds runtime sigpatches). Merge, don't delete.
+[[ -d "$REPO/sd-stage/atmosphere" ]] && rsync -rt "$REPO/sd-stage/atmosphere/" "$SD/atmosphere/"
 [[ -f "$REPO/sd-stage/retroarch.jpg" ]] && cp "$REPO/sd-stage/retroarch.jpg" "$SD/retroarch.jpg"
 
 echo "==> RetroArch seed config (only if none exists yet — won't clobber your settings)"
