@@ -12,14 +12,13 @@ if [[ -x "$TOOLS/bin/hacbrewpack" ]]; then
     exit 0
 fi
 
-if [[ ! -d "$TOOLS/hacBrewPack" ]]; then
-    # The-4n's original repo is gone; this fork is a pristine mirror at final v3.05.
-    git clone --depth 1 --branch v3.05 https://github.com/dragonflylee/hacBrewPack "$TOOLS/hacBrewPack"
-fi
+# Source is vendored in-repo (upstream The-4n/hacBrewPack no longer exists;
+# this is the final v3.05, from the dragonflylee mirror fork).
+SRC="$REPO/vendor/hacBrewPack"
 
-[[ -f "$TOOLS/hacBrewPack/config.mk" ]] || cp "$TOOLS/hacBrewPack/config.mk.template" "$TOOLS/hacBrewPack/config.mk"
-make -C "$TOOLS/hacBrewPack"
+[[ -f "$SRC/config.mk" ]] || cp "$SRC/config.mk.template" "$SRC/config.mk"
+make -C "$SRC"
 mkdir -p "$TOOLS/bin"
-cp "$TOOLS/hacBrewPack/hacbrewpack" "$TOOLS/bin/hacbrewpack"
+cp "$SRC/hacbrewpack" "$TOOLS/bin/hacbrewpack"
 echo "Built tools/bin/hacbrewpack"
 "$TOOLS/bin/hacbrewpack" --help 2>&1 | head -3 || true

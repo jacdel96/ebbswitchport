@@ -15,3 +15,7 @@ title.keys
 .venv/
 __pycache__/
 tools/
+vendor/hacBrewPack/*.o
+vendor/hacBrewPack/hacbrewpack
+vendor/hacBrewPack/config.mk
+vendor/hacBrewPack/mbedtls/library/*.a
