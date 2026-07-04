@@ -96,17 +96,37 @@ export DEVKITPRO=/opt/devkitpro
 | D-pad / left stick | D-pad |
 | + | Start |
 | − | Select |
-| **ZR** | Save state |
-| **ZL** | Load state |
-| **L + R + + + −** | Quit to Homebrew Menu |
+| **ZR** | Open the in-game **menu** (does not affect SNES input) |
+
+The menu (ZR) is the only way to save, load, quit, and resume:
+
+```
+MENU
+> Resume        close the menu, keep playing
+  Save          pick one of 10 manual slots to write the current state to
+  Load          restore any state: the 10 manual slots + the 2 auto slots
+  Exit          quit to the Homebrew Menu
+```
+
+Navigate with Up/Down, **A** = select, **B** = back, **ZR** = close. The game
+pauses while the menu is open.
 
 ## Saves
 
-- **Battery (SRAM):** saving in-game (at a phone) writes to
-  `sdmc:/switch/ebbswitchport/<game>.srm`, auto-flushed ~every 10 s and on quit.
-  Quit with the exit combo (not just sleep) to guarantee the final flush.
-- **Save states:** ZR/ZL write/read `sdmc:/switch/ebbswitchport/<game>.state`.
-- Back up `sdmc:/switch/ebbswitchport/` occasionally — it's just files on the SD.
+There are **12 state slots** per game, all in `sdmc:/switch/ebbswitchport/`:
+
+- **10 manual slots** (`<game>.slot0` … `<game>.slot9`) — written from the menu's
+  **Save**, restored from **Load**.
+- **2 automatic slots**, updated in the background while you play:
+  - `<game>.auto1` — refreshed **every ~1 minute** and on exit. This is your
+    crash/battery safety net **and** the auto-resume point.
+  - `<game>.auto10` — refreshed **every ~10 minutes** (a deeper fallback).
+- **Auto-resume:** on launch the game silently continues from `auto1`, so it
+  picks up exactly where you left off.
+- **Battery (SRAM):** in-game saves (at a phone) write to `<game>.srm`,
+  auto-flushed ~every 10 s and on exit.
+
+Back up `sdmc:/switch/ebbswitchport/` occasionally — it's just files on the SD.
 
 Native NROs launched from the Homebrew Menu don't need sigpatches, so a firmware
 or Atmosphere update won't break them the way installed forwarders did. After a

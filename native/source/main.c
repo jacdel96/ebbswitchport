@@ -1,9 +1,10 @@
-// ebbswitchport native frontend — Milestone 2: snes9x libretro core + video.
+// ebbswitchport native frontend.
 //
 // Statically links the snes9x libretro core, loads romfs:/game.sfc, and drives
 // a libnx framebuffer from the core's video callback. Input is mapped from the
-// Switch pad to the SNES layout. Audio and persistence are stubbed here and
-// filled in by M3/M4.
+// Switch pad to the SNES layout; audio goes out via audio.c. ZR opens an
+// in-game menu (osd.c) for save/load across 10 manual + 2 automatic state
+// slots, plus battery-SRAM persistence and auto-resume from the 1-min auto slot.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,6 +14,7 @@
 
 #include "audio.h"
 #include "libretro.h"
+#include "osd.h"
 
 #ifndef GAME_ID
 #define GAME_ID "game"
@@ -36,6 +38,19 @@ static unsigned g_map_w = 0, g_map_h = 0;
 #define DST_W 960
 #define DST_X0 ((FB_W - DST_W) / 2)
 #define DST_Y0 ((FB_H - DST_H) / 2)
+
+// The last fully-rendered game frame (persistent). video_refresh fills this;
+// present() copies it to the real framebuffer. Keeping it around lets the menu
+// composite over a frozen frame while the game is paused.
+static u32 *g_frame = NULL;
+
+// In-game menu (opened with ZR). Levels: 0 = main, 1 = save-slot list,
+// 2 = load-slot list.
+#define SLOT_COUNT 10            // manual slots 0..9
+#define LOAD_COUNT (SLOT_COUNT + 2)  // + auto1 + auto10
+static bool g_menu_open = false;
+static int g_menu_level = 0;
+static int g_menu_sel = 0;
 
 // --- pixel conversion --------------------------------------------------------
 static inline u32 rgb565_to_rgba(u16 p) {
@@ -66,14 +81,10 @@ static void video_refresh(const void *data, unsigned width, unsigned height,
         g_map_w = width; g_map_h = height;
     }
 
-    u32 stride;
-    u32 *out = (u32 *)framebufferBegin(&g_fb, &stride);
-    const u32 row_px = stride / sizeof(u32);
     const int bpp = (g_px_fmt == RETRO_PIXEL_FORMAT_XRGB8888) ? 4 : 2;
-
     for (unsigned dy = 0; dy < DST_H; dy++) {
         const u8 *src_row = (const u8 *)data + (size_t)g_map_y[dy] * pitch;
-        u32 *dst_row = out + (size_t)(DST_Y0 + dy) * row_px + DST_X0;
+        u32 *dst_row = g_frame + (size_t)(DST_Y0 + dy) * FB_W + DST_X0;
         if (bpp == 2) {
             const u16 *s = (const u16 *)src_row;
             for (unsigned dx = 0; dx < DST_W; dx++)
@@ -84,7 +95,6 @@ static void video_refresh(const void *data, unsigned width, unsigned height,
                 dst_row[dx] = xrgb8888_to_rgba(s[g_map_x[dx]]);
         }
     }
-    framebufferEnd(&g_fb);
 }
 
 static bool environ_cb(unsigned cmd, void *data) {
@@ -211,33 +221,154 @@ static void sram_save(void) {
     rename(tmp, path);
 }
 
-static void state_save(void) {
+// Serialize the whole machine to <game>.<ext> (atomically via a temp file).
+static void state_save(const char *ext) {
     size_t size = retro_serialize_size();
     if (!size) return;
     void *buf = malloc(size);
     if (!buf) return;
     if (retro_serialize(buf, size)) {
-        char path[256];
-        save_path(path, sizeof(path), "state");
-        FILE *f = fopen(path, "wb");
-        if (f) { fwrite(buf, 1, size, f); fclose(f); }
+        char path[256], tmp[264];
+        save_path(path, sizeof(path), ext);
+        snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+        FILE *f = fopen(tmp, "wb");
+        if (f) {
+            fwrite(buf, 1, size, f);
+            fclose(f);
+            remove(path);
+            rename(tmp, path);
+        }
     }
     free(buf);
 }
 
-static void state_load(void) {
+// Restore a machine snapshot from <game>.<ext>. Returns true if a state was
+// present and successfully loaded.
+static bool state_load(const char *ext) {
     char path[256];
-    save_path(path, sizeof(path), "state");
+    save_path(path, sizeof(path), ext);
     FILE *f = fopen(path, "rb");
-    if (!f) return;
+    if (!f) return false;
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
     fseek(f, 0, SEEK_SET);
     void *buf = malloc(size);
-    if (buf && fread(buf, 1, size, f) == (size_t)size)
-        retro_unserialize(buf, size);
+    bool ok = buf && fread(buf, 1, size, f) == (size_t)size &&
+              retro_unserialize(buf, size);
     free(buf);
     fclose(f);
+    return ok;
+}
+
+// Map a Load-list index to its state extension: 0..9 -> manual slots,
+// 10 -> 1-min auto, 11 -> 10-min auto.
+static void load_ext(int i, char *buf, size_t n) {
+    if (i < SLOT_COUNT)      snprintf(buf, n, "slot%d", i);
+    else if (i == SLOT_COUNT) snprintf(buf, n, "auto1");
+    else                      snprintf(buf, n, "auto10");
+}
+
+static bool state_exists(const char *ext) {
+    char path[256];
+    save_path(path, sizeof(path), ext);
+    FILE *f = fopen(path, "rb");
+    if (f) { fclose(f); return true; }
+    return false;
+}
+
+// --- in-game menu ------------------------------------------------------------
+static void draw_menu(u32 *fb, u32 stride) {
+    const int scale = 3;
+    const int lh = 8 * scale + 12;
+    int count = g_menu_level == 0 ? 4 : g_menu_level == 1 ? SLOT_COUNT : LOAD_COUNT;
+    const char *title = g_menu_level == 0 ? "MENU"
+                        : g_menu_level == 1 ? "SAVE STATE" : "LOAD STATE";
+
+    osd_rect(fb, stride, 0, 0, FB_W, FB_H, 0xB0000000u);  // dim the game
+    int pw = 620, ph = lh * (count + 2) + 40;
+    int px = (FB_W - pw) / 2, py = (FB_H - ph) / 2;
+    osd_rect(fb, stride, px, py, pw, ph, 0xF0181818u);    // panel
+    osd_rect(fb, stride, px, py, pw, 4, 0xFF66CCFFu);     // accent bar
+
+    int tx = px + 40, ty = py + 28;
+    osd_text(fb, stride, tx, ty, 0xFF66CCFFu, scale, title);
+    ty += lh + 10;
+
+    for (int i = 0; i < count; i++) {
+        char line[48];
+        if (g_menu_level == 0) {
+            const char *m[] = {"Resume", "Save", "Load", "Exit"};
+            snprintf(line, sizeof(line), "%s", m[i]);
+        } else {
+            char ext[16];
+            const char *name;
+            char nbuf[24];
+            if (g_menu_level == 1) {         // save: manual slots only
+                snprintf(ext, sizeof(ext), "slot%d", i);
+                snprintf(nbuf, sizeof(nbuf), "Slot %d", i);
+                name = nbuf;
+            } else {                          // load: slots + autos
+                load_ext(i, ext, sizeof(ext));
+                if (i < SLOT_COUNT) snprintf(nbuf, sizeof(nbuf), "Slot %d", i);
+                else if (i == SLOT_COUNT) snprintf(nbuf, sizeof(nbuf), "Auto 1 min");
+                else snprintf(nbuf, sizeof(nbuf), "Auto 10 min");
+                name = nbuf;
+            }
+            snprintf(line, sizeof(line), "%-12s %s", name,
+                     state_exists(ext) ? "[saved]" : "[empty]");
+        }
+        u32 col = (i == g_menu_sel) ? 0xFF00FFFFu : 0xFFFFFFFFu;
+        if (i == g_menu_sel) osd_text(fb, stride, px + 14, ty, col, scale, ">");
+        osd_text(fb, stride, tx, ty, col, scale, line);
+        ty += lh;
+    }
+    osd_text(fb, stride, tx, py + ph - 26, 0xFF888888u, 2,
+             "UP/DOWN move   A select   B back   ZR close");
+}
+
+// Present the last game frame (+ menu overlay if open) to the display.
+static void present(void) {
+    u32 stride;
+    u32 *out = (u32 *)framebufferBegin(&g_fb, &stride);
+    const u32 row_px = stride / sizeof(u32);
+    for (int y = 0; y < FB_H; y++)
+        memcpy(out + (size_t)y * row_px, g_frame + (size_t)y * FB_W,
+               FB_W * sizeof(u32));
+    if (g_menu_open) draw_menu(out, row_px);
+    framebufferEnd(&g_fb);
+}
+
+// Handle a frame of input while the menu is open.
+static void menu_input(u64 down, bool *quit) {
+    int count = g_menu_level == 0 ? 4 : g_menu_level == 1 ? SLOT_COUNT : LOAD_COUNT;
+    if (down & (HidNpadButton_Down | HidNpadButton_StickLDown))
+        g_menu_sel = (g_menu_sel + 1) % count;
+    if (down & (HidNpadButton_Up | HidNpadButton_StickLUp))
+        g_menu_sel = (g_menu_sel + count - 1) % count;
+    if (down & HidNpadButton_ZR) { g_menu_open = false; return; }  // toggle close
+    if (down & HidNpadButton_B) {
+        if (g_menu_level == 0) g_menu_open = false;
+        else { g_menu_level = 0; g_menu_sel = 0; }
+        return;
+    }
+    if (down & HidNpadButton_A) {
+        if (g_menu_level == 0) {
+            if (g_menu_sel == 0) g_menu_open = false;                       // Resume
+            else if (g_menu_sel == 1) { g_menu_level = 1; g_menu_sel = 0; } // Save
+            else if (g_menu_sel == 2) { g_menu_level = 2; g_menu_sel = 0; } // Load
+            else *quit = true;                                             // Exit
+        } else if (g_menu_level == 1) {
+            char ext[16];
+            snprintf(ext, sizeof(ext), "slot%d", g_menu_sel);
+            state_save(ext);
+            g_menu_open = false;
+        } else {
+            char ext[16];
+            load_ext(g_menu_sel, ext, sizeof(ext));
+            state_load(ext);
+            g_menu_open = false;
+        }
+    }
 }
 
 int main(int argc, char **argv) {
@@ -250,6 +381,10 @@ int main(int argc, char **argv) {
     NWindow *win = nwindowGetDefault();
     framebufferCreate(&g_fb, win, FB_W, FB_H, PIXEL_FORMAT_RGBA_8888, 2);
     framebufferMakeLinear(&g_fb);
+
+    // Persistent frame (opaque black to start, incl. the side pillar-bars).
+    g_frame = malloc((size_t)FB_W * FB_H * sizeof(u32));
+    for (int i = 0; i < FB_W * FB_H; i++) g_frame[i] = 0xFF000000u;
 
     retro_set_environment(environ_cb);
     retro_set_video_refresh(video_refresh);
@@ -269,33 +404,42 @@ int main(int argc, char **argv) {
 
     ensure_save_dir();
     sram_load();
+    // Auto-resume: continue from the freshest auto-state (a full snapshot, so
+    // it supersedes the SRAM load above). auto1 is refreshed every minute and
+    // on exit, so it's the most up-to-date restore point.
+    state_load("auto1");
 
-    const u64 EXIT_COMBO = HidNpadButton_L | HidNpadButton_R |
-                           HidNpadButton_Plus | HidNpadButton_Minus;
+    bool quit = false;
     unsigned frame = 0;
-    while (appletMainLoop()) {
+    while (appletMainLoop() && !quit) {
         padUpdate(&pad);
-        g_held = padGetButtons(&pad);
         u64 down = padGetButtonsDown(&pad);
 
-        if ((g_held & EXIT_COMBO) == EXIT_COMBO)
-            break;
-        // Save states on the triggers (ZR = save, ZL = load) — not SNES buttons.
-        if (down & HidNpadButton_ZR) state_save();
-        if (down & HidNpadButton_ZL) state_load();
-
-        retro_run();  // drives video_refresh -> framebuffer blit
-
-        if (++frame % 600 == 0)  // flush SRAM to disk ~every 10s
-            sram_save();
+        if (g_menu_open) {
+            menu_input(down, &quit);
+        } else if (down & HidNpadButton_ZR) {
+            g_menu_open = true;         // open menu; game pauses (no retro_run)
+            g_menu_level = 0;
+            g_menu_sel = 0;
+        } else {
+            g_held = padGetButtons(&pad);
+            retro_run();                // advances the game, fills g_frame
+            frame++;
+            if (frame % 600 == 0)    sram_save();          // SRAM ~every 10s
+            if (frame % 3600 == 0)   state_save("auto1");  // auto ~every 1 min
+            if (frame % 36000 == 0)  state_save("auto10"); // auto ~every 10 min
+        }
+        present();
     }
 
-    sram_save();          // final flush on exit
+    sram_save();            // final flush on exit
+    state_save("auto1");    // snapshot on exit so next launch resumes here
     retro_unload_game();
 cleanup:
     audio_exit();
     retro_deinit();
     free(g_rom);
+    free(g_frame);
     free(g_map_x);
     free(g_map_y);
     framebufferClose(&g_fb);
