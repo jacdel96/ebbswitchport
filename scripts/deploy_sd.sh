@@ -1,14 +1,12 @@
 #!/bin/bash
-# Copy everything the Switch needs onto the microSD card.
+# Copy the built native NROs onto the Switch microSD card.
 #
 # Usage: scripts/deploy_sd.sh /Volumes/<SD-CARD-NAME>
 #
-# Copies:
-#   sd-stage/retroarch/   -> SD /retroarch/        (RetroArch config, assets, cores)
-#   sd-stage/switch/      -> SD /switch/           (RetroArch app, on-Switch forwarder generator)
-#   roms/*.sfc            -> SD /roms/snes/        (base + patched ROMs)
-#   assets/icons/*.jpg    -> SD /switch/icons/     (for the on-Switch generator UI)
-#   out/*.nsp             -> SD /nsp/              (install these with DBI/Goldleaf)
+# Each NRO is fully self-contained (frontend + snes9x core + embedded ROM),
+# so this just drops native/build-out/*.nro into the SD's /switch/ folder —
+# launch them from the Homebrew Menu. Saves are written on-console to
+# sdmc:/switch/ebbswitchport/.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -26,45 +24,19 @@ if [[ ! -d "$SD/Nintendo" && ! -d "$SD/atmosphere" ]]; then
     [[ "$ans" == "y" || "$ans" == "Y" ]] || exit 1
 fi
 
-echo "==> RetroArch + cores"
-rsync -rt --progress "$REPO/sd-stage/retroarch/" "$SD/retroarch/"
-rsync -rt "$REPO/sd-stage/switch/" "$SD/switch/"
-[[ -d "$REPO/sd-stage/bootloader" ]] && rsync -rt "$REPO/sd-stage/bootloader/" "$SD/bootloader/"
-# sys-patch sysmodule + overlay (adds runtime sigpatches). Merge, don't delete.
-[[ -d "$REPO/sd-stage/atmosphere" ]] && rsync -rt "$REPO/sd-stage/atmosphere/" "$SD/atmosphere/"
-[[ -f "$REPO/sd-stage/retroarch.jpg" ]] && cp "$REPO/sd-stage/retroarch.jpg" "$SD/retroarch.jpg"
-
-echo "==> RetroArch seed config (only if none exists yet — won't clobber your settings)"
-if [[ ! -f "$SD/retroarch/retroarch.cfg" ]]; then
-    mkdir -p "$SD/retroarch"
-    cp "$REPO/config/retroarch.cfg" "$SD/retroarch/retroarch.cfg"
-    echo "  seeded retroarch.cfg (SRAM autosave, save/state paths)"
+echo "==> Native NROs -> $SD/switch/"
+mkdir -p "$SD/switch"
+found=0
+for nro in "$REPO/native/build-out/"*.nro; do
+    [[ -e "$nro" ]] || continue
+    found=1
+    rsync -t --progress "$nro" "$SD/switch/"
+done
+if [[ "$found" == 0 ]]; then
+    echo "  (no NROs in native/build-out/ — run scripts/build_native.sh first)" >&2
+    exit 1
 fi
-
-echo "==> ROMs"
-mkdir -p "$SD/roms/snes"
-found_rom=0
-for rom in "$REPO/roms/"*.sfc; do
-    [[ -e "$rom" ]] || continue
-    found_rom=1
-    rsync -t "$rom" "$SD/roms/snes/"
-done
-[[ "$found_rom" == 1 ]] || echo "  (no ROMs in roms/ yet — run scripts/apply_patches.py first)"
-
-echo "==> Icons (for the on-Switch forwarder generator)"
-mkdir -p "$SD/switch/icons"
-rsync -t "$REPO/assets/icons/"*.jpg "$SD/switch/icons/"
-
-echo "==> NSP forwarders"
-mkdir -p "$SD/nsp"
-found_nsp=0
-for nsp in "$REPO/out/"*.nsp; do
-    [[ -e "$nsp" ]] || continue
-    found_nsp=1
-    rsync -t "$nsp" "$SD/nsp/"
-done
-[[ "$found_nsp" == 1 ]] || echo "  (no NSPs in out/ yet — run scripts/build_forwarders.py first)"
 
 echo
 echo "Done. Eject the card cleanly:  diskutil eject '$SD'"
-echo "Then on the Switch: install /nsp/*.nsp with DBI or Goldleaf."
+echo "Then on the Switch: Homebrew Menu -> launch each game from /switch/."

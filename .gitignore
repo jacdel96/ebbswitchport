@@ -1,21 +1,20 @@
-# Nintendo-copyrighted content and console secrets — NEVER commit these
+# Nintendo-copyrighted content — NEVER commit these
 roms/
-keys/
-out/
-sd-stage/
 *.sfc
 *.smc
-*.nsp
 *.nro
-prod.keys
-title.keys
+
+# Native NRO build artifacts (the .nro embeds the ROM)
+native/build/
+native/build-out/
+native/*.elf
+native/*.nacp
+native/romfs/*.sfc
+native/.icon.jpg
+native/vendor/snes9x/
+native/lib/*.a
 
 # OS noise
 .DS_Store
 .venv/
 __pycache__/
-tools/
-vendor/hacBrewPack/*.o
-vendor/hacBrewPack/hacbrewpack
-vendor/hacBrewPack/config.mk
-vendor/hacBrewPack/mbedtls/library/*.a

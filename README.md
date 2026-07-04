@@ -1,119 +1,134 @@
 # ebbswitchport
 
-Home-screen apps for a Nintendo Switch running Atmosphere that boot straight into:
+Self-contained Nintendo Switch homebrew apps that boot straight into SNES
+EarthBound games. Each is a single `.nro`: a small **libnx** C frontend that
+statically links the **snes9x libretro core** and embeds the ROM in RomFS — no
+RetroArch, no NSP forwarder, no sigpatches. Launch from the Homebrew Menu.
+
+Three titles:
 
 1. **EarthBound** (SNES)
-2. **EarthBound Beginnings Remake** — the [2026 fan remake of MOTHER 1](https://ebbr.neocities.org/) as a BPS patch over EarthBound
-3. **EarthBound: Giygas Strikes Back** — the companion QoL patch (run button, batch buying, bug fixes)
+2. **EarthBound Beginnings Remake** — the [2026 fan remake of MOTHER 1](https://ebbr.neocities.org/), a BPS patch over EarthBound
+3. **EarthBound: Giygas Strikes Back** — companion QoL patch (run button, batch buying, bug fixes)
 
-Architecture: **RetroArch (snes9x core)** as the emulator, plus one installable **NSP forwarder per game** — a tiny title with custom icon that launches the core with the right ROM, full-screen, no menus. RetroArch provides SRAM saves (auto-flushed every 60s), save states, and rewind.
+> **Never commit ROMs.** `roms/`, all `.sfc/.smc`, and the built `.nro` (which
+> embeds the ROM) are gitignored. This repo holds only C source, scripts, BPS
+> patches, icons, and docs. Keep it private regardless. The built NRO contains
+> copyrighted content — personal use only, never distribute.
 
-> **Never commit ROMs or console keys.** `roms/`, `keys/`, `out/`, `sd-stage/` and all `.sfc/.smc/.nsp/.nro` files are gitignored. This repo holds only scripts, BPS patches, icons, and docs. Keep the repo private regardless.
+## Layout
 
-## What you supply (not in the repo)
+```
+native/
+├── Makefile           devkitPro switch-app build; links the snes9x core + romfs
+├── source/
+│   ├── main.c         libretro frontend: video, input, saves, main loop
+│   ├── audio.c/.h     resamples core audio (~32 kHz) -> 48 kHz -> audout
+│   └── libretro.h     libretro API (from snes9x, permissively licensed)
+├── lib/               snes9x_libretro_libnx.a lands here (gitignored)
+├── romfs/             game.sfc is swapped in per build (gitignored)
+└── build-out/         finished .nro per game (gitignored — embeds ROM)
+scripts/
+├── apply_patches.py   base EarthBound ROM -> patched ROMs (CRC-verified)
+├── make_icons.py      assets/art-src -> 256x256 icons
+├── build_core.sh      clone + build the snes9x static lib
+├── build_native.sh    build one .nro per game (ROM + icon + title baked in)
+└── deploy_sd.sh       copy native/build-out/*.nro to the SD's /switch/
+patches/               BPS patches (diffs only — no Nintendo code)
+assets/                art-src/ (box art) + icons/ (built 256x256 JPEGs)
+roms/                  (gitignored) base + patched ROMs
+```
 
-| File | Where it goes | How to get it |
-|---|---|---|
-| `EarthBound (USA).sfc` | `roms/` | Your legally owned cartridge dump. Headerless CRC32 must be `DC9BB451` — the base both BPS patches require (a 512-byte copier header is stripped automatically). |
-| `prod.keys` | `keys/` | Dump once from *your* console with Lockpick_RCM. Only needed for the on-Mac NSP build (Path A). |
+## What you supply
 
-## One-time setup (Mac)
+Drop your legally-owned **`EarthBound (USA)` ROM** into `roms/`. Headerless CRC32
+must be `DC9BB451` (a 512-byte copier header is stripped automatically). That's the
+only non-repo input — no console keys needed for the native track.
+
+## Prerequisites (one time, Mac)
+
+**devkitPro** (the Switch toolchain):
+
+```bash
+curl -L -o /tmp/dkp.pkg https://github.com/devkitPro/pacman/releases/latest/download/devkitpro-pacman-installer.pkg
+sudo installer -pkg /tmp/dkp.pkg -target /
+sudo /opt/devkitpro/pacman/bin/pacman -Sy switch-dev
+```
+
+If pacman errors with `GPGME error: Invalid crypto engine`: `brew install gnupg`,
+or set `SigLevel = Never` under `[options]` in
+`/opt/devkitpro/pacman/etc/pacman.conf` (installs are over HTTPS from devkitPro).
+
+**Python + Pillow** (for the ROM patcher and icon maker):
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install pillow
-./scripts/setup_tools.sh          # builds hacbrewpack from source into tools/bin/
 ```
 
-## Build everything
+## Build
 
 ```bash
+export DEVKITPRO=/opt/devkitpro
+./scripts/build_core.sh                       # once: snes9x_libretro_libnx.a -> native/lib/
 .venv/bin/python scripts/apply_patches.py     # base ROM -> 2 patched ROMs (CRC-verified)
-.venv/bin/python scripts/make_icons.py        # assets/art-src -> 256x256 icons
-.venv/bin/python scripts/build_forwarders.py  # -> out/*.nsp (needs keys/prod.keys)
+.venv/bin/python scripts/make_icons.py        # -> assets/icons/
+./scripts/build_native.sh                     # -> native/build-out/*.nro (one per game)
 ```
 
-Title IDs are pinned in `build_forwarders.py` — do not change them once installed, or the console treats a rebuild as a different app.
+## Deploy to the Switch
 
-## Getting it onto the Switch
-
-### Transfer method 1 — mount the SD card (fastest)
-
-1. Power the Switch **fully off** (hold power → Power Options → Turn Off), remove the microSD.
-2. Insert it into the Mac (reader/adapter). It mounts under `/Volumes/<NAME>` (FAT32/exFAT both mount natively).
-3. ```bash
-   scripts/deploy_sd.sh /Volumes/<NAME>
+1. Power the Switch **fully off**, remove the microSD, insert it in the Mac.
+2. ```bash
+   scripts/deploy_sd.sh "/Volumes/<SD-NAME>"
    ```
-4. **Eject cleanly** — `diskutil eject /Volumes/<NAME>` or Finder eject. Yanking it corrupts FAT filesystems.
-5. Reinsert the card, boot back into Atmosphere.
+   Copies the three `.nro` files into `/switch/`.
+3. **Eject cleanly** (`diskutil eject "/Volumes/<SD-NAME>"`), reinsert, boot Atmosphere.
+4. Open the **Homebrew Menu** and launch **EarthBound** (etc.).
 
-### Transfer method 2 — wireless FTP (no SD removal)
+(Alternatively, wireless: run `ftpd` on the Switch and upload the NROs to `/switch/`.)
 
-1. On the Switch, launch **ftpd** from the Homebrew Menu (install it via the Homebrew App Store if missing). It shows an IP and port.
-2. From the Mac, connect with Cyberduck/ForkLift (or `ftp`), and upload to the same paths `deploy_sd.sh` uses: `/retroarch/`, `/switch/`, `/roms/snes/`, `/switch/icons/`, `/nsp/`.
-3. Slower than a direct mount (Wi-Fi), but fine for updating a ROM or a single NSP.
+## Controls
 
-### Path A — install the prebuilt NSPs
+| Switch | SNES |
+|---|---|
+| A / B / X / Y | A / B / X / Y |
+| L / R | L / R |
+| D-pad / left stick | D-pad |
+| + | Start |
+| − | Select |
+| **ZR** | Save state |
+| **ZL** | Load state |
+| **L + R + + + −** | Quit to Homebrew Menu |
 
-Prereq: **signature patches (sigpatches)**, since forwarder NSPs are unsigned homebrew. Without them, launching a forwarder throws `fsOpenFileSystemWithId()`. This repo stages [**sys-patch**](https://github.com/impeeza/sys-patch) into `sd-stage/atmosphere/` — a sysmodule that applies the patches at runtime and auto-adapts across firmware updates (no version-matched zip to chase). `deploy_sd.sh` copies it. After deploying, reboot the console once so the sysmodule loads (check the `sys-patch` overlay via Tesla, or just confirm forwarders now launch). Requires booting Atmosphere via hekate or an IPS-capable fusee. If you'd rather use static patches, the GBAtemp "Sigpatches for Atmosphere" thread publishes per-version bundles that extract over the SD root instead.
+## Saves
 
-1. On the Switch, open **DBI** (or Goldleaf) from the Homebrew Menu.
-2. *Browse SD* → `/nsp/` → install each of the three NSPs to the SD card.
-3. The three icons appear on the home screen.
+- **Battery (SRAM):** saving in-game (at a phone) writes to
+  `sdmc:/switch/ebbswitchport/<game>.srm`, auto-flushed ~every 10 s and on quit.
+  Quit with the exit combo (not just sleep) to guarantee the final flush.
+- **Save states:** ZR/ZL write/read `sdmc:/switch/ebbswitchport/<game>.state`.
+- Back up `sdmc:/switch/ebbswitchport/` occasionally — it's just files on the SD.
 
-### Path B — generate forwarders on the Switch itself (no keys, no Mac build)
-
-Use this if you don't want `prod.keys` on the Mac, or after a firmware update broke the installed forwarders and you just want to regenerate quickly.
-
-1. Launch **NSP Forwarder** (`nsp-forwarder.nro`, already deployed to `/switch/`) from the Homebrew Menu.
-2. Pick the NRO: `/retroarch/cores/snes9x_libretro_libnx.nro`.
-3. Set the ROM argument to the game's path, e.g. `/roms/snes/EarthBound Beginnings Remake.sfc`.
-4. Pick the icon from `/switch/icons/`, set the title name, generate, and install when prompted.
-5. Repeat per game.
-
-## First boot checklist
-
-- Launch each icon: it should go straight into the game, full screen. (First RetroArch launch may briefly build its config.)
-- **In-game saves**: save at any save point (phone). `retroarch.cfg` flushes SRAM every 60 s and on clean exit; saves land in `/retroarch/saves/`. To be safe, quit via RetroArch's menu (press both sticks → Close Content) rather than just sleeping the console mid-save.
-- **Save states**: press both analog sticks to open the Quick Menu → Save/Load State. States live in `/retroarch/states/`, auto-indexed per game.
-- Back up `/retroarch/saves/` occasionally — it's just files on the SD card.
-
-## After a firmware or Atmosphere update
-
-Installed forwarders sometimes stop launching after major updates (sigpatches go stale, or the hbl the stub relies on changes). Fix:
-
-1. Update Atmosphere + matching sigpatches.
-2. If a forwarder still fails: reinstall the same NSP (Path A) — title IDs are pinned, so it's an in-place update — or regenerate on-console (Path B).
-3. RetroArch itself may also want updating: re-run `deploy_sd.sh` after refreshing `sd-stage/` with a newer release.
+Native NROs launched from the Homebrew Menu don't need sigpatches, so a firmware
+or Atmosphere update won't break them the way installed forwarders did. After a
+major update just re-launch from hbmenu.
 
 ## Rebuilding from scratch
 
 ```bash
 git clone <this repo> && cd ebbswitchport
 python3 -m venv .venv && .venv/bin/pip install pillow
-./scripts/setup_tools.sh
-# drop EarthBound ROM into roms/, prod.keys into keys/
-# re-download RetroArch into sd-stage/ (see scripts/README note below)
+export DEVKITPRO=/opt/devkitpro
+# drop EarthBound (USA).sfc into roms/
+./scripts/build_core.sh
 .venv/bin/python scripts/apply_patches.py
 .venv/bin/python scripts/make_icons.py
-.venv/bin/python scripts/build_forwarders.py
-scripts/deploy_sd.sh /Volumes/<SD>
+./scripts/build_native.sh
+scripts/deploy_sd.sh "/Volumes/<SD>"
 ```
-
-`sd-stage/` is not committed (it's ~1 GB of RetroArch binaries). To recreate it:
-
-```bash
-mkdir -p sd-stage && cd sd-stage
-curl -fLO https://buildbot.libretro.com/stable/1.22.2/nintendo/switch/libnx/RetroArch.7z
-tar -xf RetroArch.7z && rm RetroArch.7z
-curl -fsL -o switch/nsp-forwarder.nro https://github.com/TooTallNate/switch-nsp-forwarder/releases/download/0.0.8/nsp-forwarder.nro
-```
-
-The RetroArch seed config lives in the repo at `config/retroarch.cfg`; `deploy_sd.sh` copies it to the SD card only when no config exists there yet (so it never clobbers settings you've changed on-console).
 
 ## Credits
 
-- [EarthBound Beginnings Remake](https://ebbr.neocities.org/) by Gabbls & team (lineage back to Tomato's 2007 project)
-- [RetroArch](https://www.retroarch.com/) / snes9x (libretro)
-- Forwarder stub + recipe from [nton](https://github.com/rlaphoenix/nton) by rlaphoenix (see `assets/forwarder-stub/hacbrewpack.license`)
-- [switch-nsp-forwarder](https://github.com/TooTallNate/switch-nsp-forwarder) by TooTallNate
-- [hacBrewPack](https://github.com/The-4n/hacBrewPack) by The-4n
+- [EarthBound Beginnings Remake](https://ebbr.neocities.org/) by Gabbls & team
+- [snes9x](https://github.com/snes9xgit/snes9x) / the libretro core
+- [devkitPro / libnx](https://devkitpro.org/) — the Switch homebrew toolchain
+- libretro API (`libretro.h`)
