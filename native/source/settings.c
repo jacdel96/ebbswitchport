@@ -14,6 +14,9 @@ void settings_load(Settings *out) {
     out->hw_accel = false;
     out->audio_buffer_ms = 30;
     out->show_hud = false;
+    out->dynamic_overclock = true;
+    out->overclock_trigger_dupes = 5;
+    out->overclock_boost_frames = 100;
 
     FILE *f = fopen(SETTINGS_PATH, "rb");
     if (!f) return;
@@ -23,6 +26,9 @@ void settings_load(Settings *out) {
         if (sscanf(line, "hw_accel=%d", &v) == 1) out->hw_accel = v != 0;
         else if (sscanf(line, "audio_buffer_ms=%d", &v) == 1) out->audio_buffer_ms = (unsigned)v;
         else if (sscanf(line, "show_hud=%d", &v) == 1) out->show_hud = v != 0;
+        else if (sscanf(line, "dynamic_overclock=%d", &v) == 1) out->dynamic_overclock = v != 0;
+        else if (sscanf(line, "overclock_trigger_dupes=%d", &v) == 1) out->overclock_trigger_dupes = (unsigned)v;
+        else if (sscanf(line, "overclock_boost_frames=%d", &v) == 1) out->overclock_boost_frames = (unsigned)v;
     }
     fclose(f);
 }
@@ -32,8 +38,10 @@ void settings_save(const Settings *s) {
     mkdir(SETTINGS_DIR, 0777);
     FILE *f = fopen(SETTINGS_TMP, "wb");
     if (!f) return;
-    fprintf(f, "hw_accel=%d\naudio_buffer_ms=%u\nshow_hud=%d\n",
-            s->hw_accel ? 1 : 0, s->audio_buffer_ms, s->show_hud ? 1 : 0);
+    fprintf(f, "hw_accel=%d\naudio_buffer_ms=%u\nshow_hud=%d\ndynamic_overclock=%d\n"
+               "overclock_trigger_dupes=%u\noverclock_boost_frames=%u\n",
+            s->hw_accel ? 1 : 0, s->audio_buffer_ms, s->show_hud ? 1 : 0,
+            s->dynamic_overclock ? 1 : 0, s->overclock_trigger_dupes, s->overclock_boost_frames);
     fclose(f);
     remove(SETTINGS_PATH);
     rename(SETTINGS_TMP, SETTINGS_PATH);

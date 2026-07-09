@@ -16,8 +16,8 @@
 
 // The small HUD panel's fixed pixel size (shared with main.c, which builds the
 // panel's pixels via osd_rect/osd_text before handing them to gpu_video_set_hud).
-// Wide enough for "FPS 60.0  AUDIO 100ms  LAG 100%" at scale 2 plus padding.
-#define HUD_W 560
+// Wide enough for "FPS 60.0  AUDIO 100ms  LAG 100%  OC" at scale 2 plus padding.
+#define HUD_W 620
 #define HUD_H 56
 
 bool gpu_video_init(NWindow *win);

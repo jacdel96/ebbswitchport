@@ -10,6 +10,7 @@ native/build-out/
 native/*.elf
 native/*.nacp
 native/romfs/*.sfc
+native/romfs/shaders/
 native/.icon.jpg
 native/vendor/snes9x/
 native/lib/*.a

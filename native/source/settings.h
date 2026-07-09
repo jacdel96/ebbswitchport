@@ -9,6 +9,10 @@ typedef struct {
                                 // default off — crashed on real hardware in initial testing
     unsigned audio_buffer_ms;  // audio_set_buffer_ms() target; one of the presets in main.c
     bool     show_hud;         // draw a live FPS/audio-buffer readout while playing
+    bool     dynamic_overclock; // temporarily overclock the CPU core on sustained frame
+                                 // drops (see main.c's overclock_tick); live, no restart
+    unsigned overclock_trigger_dupes; // consecutive dupes that arm a boost
+    unsigned overclock_boost_frames;  // how long a boost lasts once (re)armed
 } Settings;
 
 // Fills *out with defaults, then overrides from sdmc:/switch/ebbswitchport/settings.cfg

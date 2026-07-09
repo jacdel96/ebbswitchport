@@ -53,7 +53,8 @@ static u32 *g_frame = NULL;
 #define SLOT_COUNT 10            // manual slots 0..9
 #define LOAD_COUNT (SLOT_COUNT + 2)  // + auto1 + auto10
 #define MAIN_COUNT 6             // Resume/Save/Load/Reset/Settings/Exit
-#define SETTINGS_COUNT 3         // Hardware Accel/Audio Buffer/Show HUD
+#define SETTINGS_COUNT 6         // Hardware Accel/Audio Buffer/Show HUD/Dynamic Overclock/
+                                  // OC Trigger/OC Boost
 static bool g_menu_open = false;
 static int g_menu_level = 0;
 static int g_menu_sel = 0;
@@ -93,6 +94,44 @@ static unsigned g_dupe_count = 0;   // dupes in the current window
 static unsigned g_frame_total = 0;  // total video_refresh calls in the current window
 static unsigned g_lag_pct = 0;      // last computed dupe percentage, shown in the HUD
 
+// --- dynamic CPU overclock ----------------------------------------------------
+// snes9x-libretro's "snes9x_overclock_cycles" core option (handled in
+// environ_cb below) gives the emulated 65816 more cycles per frame, which
+// helps exactly the mechanism we think is causing dupes: the ROM's own code
+// checking a per-frame CPU-cycle budget and skipping updates when it's blown.
+// Rather than run overclocked all the time (which trades away hardware-
+// accurate timing/audio sync everywhere, including scenes where it's not
+// needed), only engage it in short bursts triggered by a run of real dupes,
+// and back off once things have been smooth for a while. Both thresholds are
+// tunable from the Settings menu (g_settings.overclock_trigger_dupes/
+// overclock_boost_frames) so this can be experimented with on hardware.
+#define OVERCLOCK_TRIGGER_MIN 1
+#define OVERCLOCK_TRIGGER_MAX 30
+#define OVERCLOCK_BOOST_MIN   10
+#define OVERCLOCK_BOOST_MAX   600
+static unsigned g_dupe_streak = 0;
+static bool g_overclock_boost = false;
+static bool g_overclock_dirty = false;    // tells the core to re-poll variables
+static unsigned g_overclock_frames_left = 0;
+
+// Call once per video_refresh(), with whether that frame was a dupe.
+static void overclock_tick(bool duped) {
+    if (!g_settings.dynamic_overclock) return;  // never triggers; toggling off cancels any active boost (see settings_adjust)
+    if (duped) {
+        g_dupe_streak++;
+        if (g_dupe_streak >= g_settings.overclock_trigger_dupes) {
+            if (!g_overclock_boost) { g_overclock_boost = true; g_overclock_dirty = true; }
+            g_overclock_frames_left = g_settings.overclock_boost_frames;  // (re)arm while trouble persists
+        }
+    } else {
+        g_dupe_streak = 0;
+    }
+    if (g_overclock_boost && g_overclock_frames_left > 0 && --g_overclock_frames_left == 0) {
+        g_overclock_boost = false;
+        g_overclock_dirty = true;
+    }
+}
+
 // Call once per frame retro_run() actually advances (i.e. not while paused in
 // the menu), so the FPS/lag readings reflect real gameplay throughput.
 static void fps_tick(void) {
@@ -125,7 +164,8 @@ static PixelLut g_pixlut = {0};         // shared 16bpp->RGBA8 LUT (CPU and GPU 
 static void video_refresh(const void *data, unsigned width, unsigned height,
                           size_t pitch) {
     g_frame_total++;
-    if (!data) { g_dupe_count++; return; }  // duped frame — see g_lag_pct's comment
+    if (!data) { g_dupe_count++; overclock_tick(true); return; }  // duped frame — see g_lag_pct's comment
+    overclock_tick(false);
 
     if (g_use_gpu) {
         unsigned need = width * height;
@@ -196,8 +236,23 @@ static bool environ_cb(unsigned cmd, void *data) {
     case RETRO_ENVIRONMENT_GET_CAN_DUPE:
         *(bool *)data = true;
         return true;
-    case RETRO_ENVIRONMENT_GET_VARIABLE:
-        return false;  // core uses its defaults
+    case RETRO_ENVIRONMENT_GET_VARIABLE: {
+        struct retro_variable *var = (struct retro_variable *)data;
+        // Only the dynamic-overclock knob is actively driven (see
+        // overclock_tick); every other core variable keeps the core's default.
+        if (var->key && strcmp(var->key, "snes9x_overclock_cycles") == 0) {
+            var->value = g_overclock_boost ? "max" : "disabled";
+            return true;
+        }
+        return false;
+    }
+    case RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE:
+        // The core polls this every frame and only re-reads variables (via
+        // GET_VARIABLE, above) on the frame we report a change — this is that
+        // one-shot signal, cleared immediately after being read.
+        *(bool *)data = g_overclock_dirty;
+        g_overclock_dirty = false;
+        return true;
     case RETRO_ENVIRONMENT_SET_VARIABLES:
     case RETRO_ENVIRONMENT_SET_CORE_OPTIONS:
         return true;   // accept, ignore
@@ -363,6 +418,24 @@ static void settings_adjust(int sel, int dir) {
         audio_set_buffer_ms(g_settings.audio_buffer_ms);   // live, no restart needed
     } else if (sel == 2) {
         g_settings.show_hud = !g_settings.show_hud;        // live
+    } else if (sel == 3) {
+        g_settings.dynamic_overclock = !g_settings.dynamic_overclock;  // live
+        if (!g_settings.dynamic_overclock) {
+            // Don't leave a boost stuck engaged after turning the feature off.
+            g_dupe_streak = 0;
+            g_overclock_frames_left = 0;
+            if (g_overclock_boost) { g_overclock_boost = false; g_overclock_dirty = true; }
+        }
+    } else if (sel == 4) {
+        int v = (int)g_settings.overclock_trigger_dupes + dir;
+        if (v < OVERCLOCK_TRIGGER_MIN) v = OVERCLOCK_TRIGGER_MIN;
+        if (v > OVERCLOCK_TRIGGER_MAX) v = OVERCLOCK_TRIGGER_MAX;
+        g_settings.overclock_trigger_dupes = (unsigned)v;  // live, read fresh by overclock_tick
+    } else if (sel == 5) {
+        int v = (int)g_settings.overclock_boost_frames + dir * 10;
+        if (v < OVERCLOCK_BOOST_MIN) v = OVERCLOCK_BOOST_MIN;
+        if (v > OVERCLOCK_BOOST_MAX) v = OVERCLOCK_BOOST_MAX;
+        g_settings.overclock_boost_frames = (unsigned)v;   // live, read fresh by overclock_tick
     }
     settings_save(&g_settings);
 }
@@ -379,7 +452,7 @@ static void draw_menu(u32 *fb, u32 stride) {
                        : g_menu_level == 2 ? "LOAD STATE" : "SETTINGS";
 
     osd_rect(fb, stride, FB_H, 0, 0, FB_W, FB_H, 0xB0000000u);  // dim the game
-    int pw = 620, ph = lh * (count + 2) + 40;
+    int pw = 700, ph = lh * (count + 2) + 40;
     int px = (FB_W - pw) / 2, py = (FB_H - ph) / 2;
     osd_rect(fb, stride, FB_H, px, py, pw, ph, 0xF0181818u);    // panel
     osd_rect(fb, stride, FB_H, px, py, pw, 4, 0xFF66CCFFu);     // accent bar
@@ -398,8 +471,14 @@ static void draw_menu(u32 *fb, u32 stride) {
                                   g_settings.hw_accel ? "On" : "Off");
             else if (i == 1) snprintf(line, sizeof(line), "%-16s %ums", "Audio Buffer",
                                        g_settings.audio_buffer_ms);
-            else snprintf(line, sizeof(line), "%-16s %s", "Show HUD",
-                          g_settings.show_hud ? "On" : "Off");
+            else if (i == 2) snprintf(line, sizeof(line), "%-16s %s", "Show HUD",
+                                       g_settings.show_hud ? "On" : "Off");
+            else if (i == 3) snprintf(line, sizeof(line), "%-16s %s", "Dynamic Overclock",
+                                       g_settings.dynamic_overclock ? "On" : "Off");
+            else if (i == 4) snprintf(line, sizeof(line), "%-16s %u frames", "OC Trigger",
+                                       g_settings.overclock_trigger_dupes);
+            else snprintf(line, sizeof(line), "%-16s %u frames", "OC Boost",
+                          g_settings.overclock_boost_frames);
         } else {
             char ext[16];
             const char *name;
@@ -454,10 +533,10 @@ static void draw_menu(u32 *fb, u32 stride) {
 static void draw_hud(u32 *fb, u32 stride, u32 canvas_h, int x0, int y0) {
     AudioStats as;
     audio_stats(&as);
-    char line[48];
-    snprintf(line, sizeof(line), "FPS %u.%u  AUDIO %ums  LAG %u%%",
+    char line[56];
+    snprintf(line, sizeof(line), "FPS %u.%u  AUDIO %ums  LAG %u%%%s",
              g_fps_x10 / 10, g_fps_x10 % 10, (as.ring_frames + as.inflight_frames) / 48,
-             g_lag_pct);
+             g_lag_pct, g_overclock_boost ? "  OC" : "");
 
     const int scale = 2;
     int w = osd_text_w(line, scale) + 24, h = 8 * scale + 16;
