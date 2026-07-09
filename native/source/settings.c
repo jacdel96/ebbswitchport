@@ -1,0 +1,40 @@
+#include "settings.h"
+
+#include <stdio.h>
+#include <sys/stat.h>
+
+#define SETTINGS_DIR  "sdmc:/switch/ebbswitchport"
+#define SETTINGS_PATH SETTINGS_DIR "/settings.cfg"
+#define SETTINGS_TMP  SETTINGS_PATH ".tmp"
+
+void settings_load(Settings *out) {
+    // Off by default: the deko3d GPU path is a first, unproven cut (crashed on
+    // real hardware during initial testing) — opt-in from the Settings menu
+    // until it's verified solid, rather than every install hitting it blind.
+    out->hw_accel = false;
+    out->audio_buffer_ms = 30;
+    out->show_hud = false;
+
+    FILE *f = fopen(SETTINGS_PATH, "rb");
+    if (!f) return;
+    char line[64];
+    while (fgets(line, sizeof(line), f)) {
+        int v;
+        if (sscanf(line, "hw_accel=%d", &v) == 1) out->hw_accel = v != 0;
+        else if (sscanf(line, "audio_buffer_ms=%d", &v) == 1) out->audio_buffer_ms = (unsigned)v;
+        else if (sscanf(line, "show_hud=%d", &v) == 1) out->show_hud = v != 0;
+    }
+    fclose(f);
+}
+
+void settings_save(const Settings *s) {
+    mkdir("sdmc:/switch", 0777);
+    mkdir(SETTINGS_DIR, 0777);
+    FILE *f = fopen(SETTINGS_TMP, "wb");
+    if (!f) return;
+    fprintf(f, "hw_accel=%d\naudio_buffer_ms=%u\nshow_hud=%d\n",
+            s->hw_accel ? 1 : 0, s->audio_buffer_ms, s->show_hud ? 1 : 0);
+    fclose(f);
+    remove(SETTINGS_PATH);
+    rename(SETTINGS_TMP, SETTINGS_PATH);
+}

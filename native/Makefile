@@ -21,9 +21,13 @@ include $(DEVKITPRO)/libnx/switch_rules
 #---------------------------------------------------------------------------------
 TARGET   := $(notdir $(CURDIR))
 BUILD    := build
-SOURCES  := source
+SOURCES  := source source/shaders
 INCLUDES := include
 ROMFS    := romfs
+
+# Output subdir (under ROMFS) for compiled .dksh shaders — see the GLSLFILES/
+# ROMFS_TARGETS block below, adapted from devkitPro's deko3d example Makefiles.
+OUT_SHADERS := shaders
 
 # App metadata — overridable per game from scripts/build_native.sh
 APP_TITLE   ?= EarthBound (native)
@@ -44,8 +48,16 @@ CXXFLAGS := $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++17
 ASFLAGS := -g $(ARCH)
 LDFLAGS  = -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 
-# snes9x core static lib (C++) + libstdc++ + libnx.
-LIBS := -lsnes9x_libretro_libnx -lstdc++ -lnx -lm
+# snes9x core static lib (C++) + libstdc++ + libnx + deko3d (GPU rendering
+# backend, see gpu_video.c). Debug lib (extra internal validation/asserts) by
+# default since the GPU path hasn't run on real hardware yet; flip to 0 once
+# it's verified working, to switch to the release lib.
+DEKO3D_DEBUG ?= 1
+ifeq ($(DEKO3D_DEBUG),1)
+LIBS := -ldeko3dd -lsnes9x_libretro_libnx -lstdc++ -lnx -lm
+else
+LIBS := -ldeko3d -lsnes9x_libretro_libnx -lstdc++ -lnx -lm
+endif
 
 # lib search: native/lib (core) + libnx.
 LIBDIRS := $(PORTLIBS) $(LIBNX) $(TOPDIR)/lib
@@ -73,6 +85,21 @@ export INCLUDE := $(foreach dir,$(INCLUDES),-I$(CURDIR)/$(dir)) \
                   -I$(CURDIR)/$(BUILD)
 export LIBPATHS := $(foreach dir,$(LIBDIRS),-L$(dir)/lib) -L$(TOPDIR)/lib
 
+# Shaders: .glsl sources -> uam -> .dksh, landing in $(ROMFS)/$(OUT_SHADERS) so
+# gpu_video.c can fopen() them from romfs at runtime.
+GLSLFILES := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.glsl)))
+
+ifneq ($(strip $(ROMFS)),)
+	ROMFS_TARGETS :=
+	ROMFS_FOLDERS :=
+	ifneq ($(strip $(OUT_SHADERS)),)
+		ROMFS_SHADERS := $(ROMFS)/$(OUT_SHADERS)
+		ROMFS_TARGETS += $(patsubst %.glsl,$(ROMFS_SHADERS)/%.dksh,$(GLSLFILES))
+		ROMFS_FOLDERS += $(ROMFS_SHADERS)
+	endif
+	export ROMFS_DEPS := $(foreach file,$(ROMFS_TARGETS),$(CURDIR)/$(file))
+endif
+
 export BUILD_EXEFS_SRC := $(TOPDIR)/exefs_src
 
 ifeq ($(strip $(APP_ICON)),)
@@ -87,15 +114,30 @@ else
 endif
 
 .PHONY: $(BUILD) clean all
-all: $(BUILD)
+all: $(ROMFS_TARGETS) | $(BUILD)
+	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
 
 $(BUILD):
 	@[ -d $@ ] || mkdir -p $@
-	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
+
+ifneq ($(strip $(ROMFS_TARGETS)),)
+$(ROMFS_TARGETS): | $(ROMFS_FOLDERS)
+
+$(ROMFS_FOLDERS):
+	@mkdir -p $@
+
+$(ROMFS_SHADERS)/%_vsh.dksh: %_vsh.glsl
+	@echo {vert} $(notdir $<)
+	@uam -s vert -o $@ $<
+
+$(ROMFS_SHADERS)/%_fsh.dksh: %_fsh.glsl
+	@echo {frag} $(notdir $<)
+	@uam -s frag -o $@ $<
+endif
 
 clean:
 	@echo clean ...
-	@rm -fr $(BUILD) $(TARGET).nro $(TARGET).nacp $(TARGET).elf
+	@rm -fr $(BUILD) $(ROMFS_FOLDERS) $(TARGET).nro $(TARGET).nacp $(TARGET).elf
 
 else
 .PHONY: all
@@ -103,7 +145,7 @@ DEPENDS := $(OFILES:.o=.d)
 
 all: $(OUTPUT).nro
 
-$(OUTPUT).nro : $(OUTPUT).elf $(OUTPUT).nacp
+$(OUTPUT).nro : $(OUTPUT).elf $(OUTPUT).nacp $(ROMFS_DEPS)
 $(OUTPUT).elf : $(OFILES)
 
 -include $(DEPENDS)

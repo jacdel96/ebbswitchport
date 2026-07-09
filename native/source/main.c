@@ -13,8 +13,12 @@
 #include <switch.h>
 
 #include "audio.h"
+#include "gpu_video.h"
 #include "libretro.h"
 #include "osd.h"
+#include "pixfmt.h"
+#include "save_io.h"
+#include "settings.h"
 
 #ifndef GAME_ID
 #define GAME_ID "game"
@@ -45,31 +49,96 @@ static unsigned g_map_w = 0, g_map_h = 0;
 static u32 *g_frame = NULL;
 
 // In-game menu (opened with ZR). Levels: 0 = main, 1 = save-slot list,
-// 2 = load-slot list.
+// 2 = load-slot list, 3 = settings.
 #define SLOT_COUNT 10            // manual slots 0..9
 #define LOAD_COUNT (SLOT_COUNT + 2)  // + auto1 + auto10
+#define MAIN_COUNT 6             // Resume/Save/Load/Reset/Settings/Exit
+#define SETTINGS_COUNT 3         // Hardware Accel/Audio Buffer/Show HUD
 static bool g_menu_open = false;
 static int g_menu_level = 0;
 static int g_menu_sel = 0;
 
-// --- pixel conversion --------------------------------------------------------
-static inline u32 rgb565_to_rgba(u16 p) {
-    u32 r = (p >> 11) & 0x1F, g = (p >> 5) & 0x3F, b = p & 0x1F;
-    r = (r << 3) | (r >> 2);
-    g = (g << 2) | (g >> 4);
-    b = (b << 3) | (b >> 2);
-    return 0xFF000000u | (b << 16) | (g << 8) | r;
+// --- settings ------------------------------------------------------------
+static Settings g_settings;
+static const unsigned AUDIO_BUFFER_PRESETS[] = {20, 30, 50, 75, 100};
+#define AUDIO_PRESET_COUNT (sizeof(AUDIO_BUFFER_PRESETS) / sizeof(AUDIO_BUFFER_PRESETS[0]))
+static int g_audio_preset_idx = 1;  // index into AUDIO_BUFFER_PRESETS; default row = 30ms
+
+// Snaps g_settings.audio_buffer_ms to the nearest preset and syncs g_audio_preset_idx —
+// used at startup, since a hand-edited settings.cfg could contain a non-preset value.
+static void audio_preset_sync(void) {
+    unsigned best_diff = ~0u;
+    for (unsigned i = 0; i < AUDIO_PRESET_COUNT; i++) {
+        unsigned diff = AUDIO_BUFFER_PRESETS[i] > g_settings.audio_buffer_ms
+                       ? AUDIO_BUFFER_PRESETS[i] - g_settings.audio_buffer_ms
+                       : g_settings.audio_buffer_ms - AUDIO_BUFFER_PRESETS[i];
+        if (diff < best_diff) { best_diff = diff; g_audio_preset_idx = i; }
+    }
+    g_settings.audio_buffer_ms = AUDIO_BUFFER_PRESETS[g_audio_preset_idx];
 }
 
-static inline u32 xrgb8888_to_rgba(u32 p) {
-    u32 r = (p >> 16) & 0xFF, g = (p >> 8) & 0xFF, b = p & 0xFF;
-    return 0xFF000000u | (b << 16) | (g << 8) | r;
+// --- live gameplay HUD (FPS + audio buffer + lag, toggled from Settings) -----
+static unsigned g_fps_x10 = 0;     // displayed fps * 10; 0 until the first window closes
+static unsigned g_fps_counter = 0;
+static u64 g_fps_tick0 = 0;
+
+// A "duped frame" (video_refresh called with data == NULL) is the core
+// explicitly telling us this frame is pixel-identical to the last — which is
+// exactly what happens on real SNES hardware when the CPU can't finish a
+// frame's work in time and the PPU holds the previous image (authentic
+// slowdown, not an emulation performance problem). Tracking the fraction of
+// recent frames that were dupes gives a live, direct signal for that, rather
+// than inferring it indirectly from perceived stutter.
+static unsigned g_dupe_count = 0;   // dupes in the current window
+static unsigned g_frame_total = 0;  // total video_refresh calls in the current window
+static unsigned g_lag_pct = 0;      // last computed dupe percentage, shown in the HUD
+
+// Call once per frame retro_run() actually advances (i.e. not while paused in
+// the menu), so the FPS/lag readings reflect real gameplay throughput.
+static void fps_tick(void) {
+    g_fps_counter++;
+    if (g_fps_counter < 30) return;
+    u64 now = armGetSystemTick();
+    if (g_fps_tick0 != 0) {
+        double secs = armTicksToNs(now - g_fps_tick0) / 1e9;
+        if (secs > 0.0) g_fps_x10 = (unsigned)(g_fps_counter * 10.0 / secs + 0.5);
+    }
+    g_fps_tick0 = now;
+    g_fps_counter = 0;
+
+    if (g_frame_total > 0) g_lag_pct = g_dupe_count * 100 / g_frame_total;
+    g_dupe_count = 0;
+    g_frame_total = 0;
 }
+
+// --- rendering backend selection ---------------------------------------------
+// GPU (deko3d) path state — populated only when g_use_gpu is true.
+static bool g_use_gpu = false;
+static u32 *g_native_frame = NULL;      // RGBA8, core's native res, GPU-path upload source
+static unsigned g_native_cap = 0;       // g_native_frame capacity, in pixels
+static unsigned g_native_w = 0, g_native_h = 0;
+static u32 *g_menu_frame = NULL;        // 1280x720 backdrop for the GPU-path menu overlay
+static u32 *g_hud_frame = NULL;         // small HUD_W x HUD_H panel for the GPU-path HUD
+static PixelLut g_pixlut = {0};         // shared 16bpp->RGBA8 LUT (CPU and GPU paths)
 
 // --- libretro callbacks ------------------------------------------------------
 static void video_refresh(const void *data, unsigned width, unsigned height,
                           size_t pitch) {
-    if (!data) return;  // duped frame
+    g_frame_total++;
+    if (!data) { g_dupe_count++; return; }  // duped frame — see g_lag_pct's comment
+
+    if (g_use_gpu) {
+        unsigned need = width * height;
+        if (need > g_native_cap) {
+            free(g_native_frame);
+            g_native_frame = malloc((size_t)need * sizeof(u32));
+            g_native_cap = need;
+        }
+        pixfmt_convert_to_rgba8(g_native_frame, data, width, height, pitch, g_px_fmt, &g_pixlut);
+        g_native_w = width; g_native_h = height;
+        gpu_video_upload_frame(g_native_frame, width, height);
+        return;
+    }
 
     // Rebuild scale maps if the core's output geometry changed.
     if (width != g_map_w || height != g_map_h) {
@@ -82,13 +151,24 @@ static void video_refresh(const void *data, unsigned width, unsigned height,
     }
 
     const int bpp = (g_px_fmt == RETRO_PIXEL_FORMAT_XRGB8888) ? 4 : 2;
+    if (bpp == 2 && g_pixlut.fmt != g_px_fmt) pixlut_rebuild(&g_pixlut, g_px_fmt);
+
+    // Consecutive dst rows usually map to the same src row (720/224 ~ 3.2x),
+    // so convert each src row once and memcpy the repeats.
+    int prev_sy = -1;
     for (unsigned dy = 0; dy < DST_H; dy++) {
-        const u8 *src_row = (const u8 *)data + (size_t)g_map_y[dy] * pitch;
         u32 *dst_row = g_frame + (size_t)(DST_Y0 + dy) * FB_W + DST_X0;
+        int sy = g_map_y[dy];
+        if (sy == prev_sy) {
+            memcpy(dst_row, dst_row - FB_W, DST_W * sizeof(u32));
+            continue;
+        }
+        prev_sy = sy;
+        const u8 *src_row = (const u8 *)data + (size_t)sy * pitch;
         if (bpp == 2) {
             const u16 *s = (const u16 *)src_row;
             for (unsigned dx = 0; dx < DST_W; dx++)
-                dst_row[dx] = rgb565_to_rgba(s[g_map_x[dx]]);
+                dst_row[dx] = g_pixlut.table[s[g_map_x[dx]]];
         } else {
             const u32 *s = (const u32 *)src_row;
             for (unsigned dx = 0; dx < DST_W; dx++)
@@ -205,41 +285,36 @@ static void sram_load(void) {
     fclose(f);
 }
 
-// Flush the core's live SRAM to disk (atomically via a temp file).
+// Snapshot the core's live SRAM and queue it for an off-main-thread write
+// (save_io.c) — capturing the copy here, on the main thread, is required
+// since it's the only thread allowed to touch the libretro core; the actual
+// SD-card write happens later, off this thread, so it can't stall audio.
 static void sram_save(void) {
     void *mem = retro_get_memory_data(RETRO_MEMORY_SAVE_RAM);
     size_t size = retro_get_memory_size(RETRO_MEMORY_SAVE_RAM);
     if (!mem || !size) return;
-    char path[256], tmp[264];
+    void *copy = malloc(size);
+    if (!copy) return;
+    memcpy(copy, mem, size);
+    char path[256];
     save_path(path, sizeof(path), "srm");
-    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
-    FILE *f = fopen(tmp, "wb");
-    if (!f) return;
-    fwrite(mem, 1, size, f);
-    fclose(f);
-    remove(path);
-    rename(tmp, path);
+    save_io_write_async(path, copy, size);
 }
 
-// Serialize the whole machine to <game>.<ext> (atomically via a temp file).
+// Serialize the whole machine and queue it for an off-main-thread write to
+// <game>.<ext> (see sram_save's comment — same reasoning applies here).
 static void state_save(const char *ext) {
     size_t size = retro_serialize_size();
     if (!size) return;
     void *buf = malloc(size);
     if (!buf) return;
     if (retro_serialize(buf, size)) {
-        char path[256], tmp[264];
+        char path[256];
         save_path(path, sizeof(path), ext);
-        snprintf(tmp, sizeof(tmp), "%s.tmp", path);
-        FILE *f = fopen(tmp, "wb");
-        if (f) {
-            fwrite(buf, 1, size, f);
-            fclose(f);
-            remove(path);
-            rename(tmp, path);
-        }
+        save_io_write_async(path, buf, size);
+    } else {
+        free(buf);
     }
-    free(buf);
 }
 
 // Restore a machine snapshot from <game>.<ext>. Returns true if a state was
@@ -276,29 +351,55 @@ static bool state_exists(const char *ext) {
     return false;
 }
 
+// --- settings menu row helpers ------------------------------------------------
+// Adjusts the settings row `sel` by one step (dir = +1/-1), applies it live
+// where that's safe (audio buffer, HUD), and persists immediately.
+static void settings_adjust(int sel, int dir) {
+    if (sel == 0) {
+        g_settings.hw_accel = !g_settings.hw_accel;      // takes effect next launch
+    } else if (sel == 1) {
+        g_audio_preset_idx = (g_audio_preset_idx + dir + AUDIO_PRESET_COUNT) % AUDIO_PRESET_COUNT;
+        g_settings.audio_buffer_ms = AUDIO_BUFFER_PRESETS[g_audio_preset_idx];
+        audio_set_buffer_ms(g_settings.audio_buffer_ms);   // live, no restart needed
+    } else if (sel == 2) {
+        g_settings.show_hud = !g_settings.show_hud;        // live
+    }
+    settings_save(&g_settings);
+}
+
 // --- in-game menu ------------------------------------------------------------
 static void draw_menu(u32 *fb, u32 stride) {
     const int scale = 3;
     const int lh = 8 * scale + 12;
-    int count = g_menu_level == 0 ? 4 : g_menu_level == 1 ? SLOT_COUNT : LOAD_COUNT;
+    int count = g_menu_level == 0 ? MAIN_COUNT
+              : g_menu_level == 1 ? SLOT_COUNT
+              : g_menu_level == 2 ? LOAD_COUNT : SETTINGS_COUNT;
     const char *title = g_menu_level == 0 ? "MENU"
-                        : g_menu_level == 1 ? "SAVE STATE" : "LOAD STATE";
+                       : g_menu_level == 1 ? "SAVE STATE"
+                       : g_menu_level == 2 ? "LOAD STATE" : "SETTINGS";
 
-    osd_rect(fb, stride, 0, 0, FB_W, FB_H, 0xB0000000u);  // dim the game
+    osd_rect(fb, stride, FB_H, 0, 0, FB_W, FB_H, 0xB0000000u);  // dim the game
     int pw = 620, ph = lh * (count + 2) + 40;
     int px = (FB_W - pw) / 2, py = (FB_H - ph) / 2;
-    osd_rect(fb, stride, px, py, pw, ph, 0xF0181818u);    // panel
-    osd_rect(fb, stride, px, py, pw, 4, 0xFF66CCFFu);     // accent bar
+    osd_rect(fb, stride, FB_H, px, py, pw, ph, 0xF0181818u);    // panel
+    osd_rect(fb, stride, FB_H, px, py, pw, 4, 0xFF66CCFFu);     // accent bar
 
     int tx = px + 40, ty = py + 28;
-    osd_text(fb, stride, tx, ty, 0xFF66CCFFu, scale, title);
+    osd_text(fb, stride, FB_H, tx, ty, 0xFF66CCFFu, scale, title);
     ty += lh + 10;
 
     for (int i = 0; i < count; i++) {
         char line[48];
         if (g_menu_level == 0) {
-            const char *m[] = {"Resume", "Save", "Load", "Exit"};
+            const char *m[] = {"Resume", "Save", "Load", "Reset", "Settings", "Exit"};
             snprintf(line, sizeof(line), "%s", m[i]);
+        } else if (g_menu_level == 3) {
+            if (i == 0) snprintf(line, sizeof(line), "%-16s %s", "Hardware Accel",
+                                  g_settings.hw_accel ? "On" : "Off");
+            else if (i == 1) snprintf(line, sizeof(line), "%-16s %ums", "Audio Buffer",
+                                       g_settings.audio_buffer_ms);
+            else snprintf(line, sizeof(line), "%-16s %s", "Show HUD",
+                          g_settings.show_hud ? "On" : "Off");
         } else {
             char ext[16];
             const char *name;
@@ -318,16 +419,89 @@ static void draw_menu(u32 *fb, u32 stride) {
                      state_exists(ext) ? "[saved]" : "[empty]");
         }
         u32 col = (i == g_menu_sel) ? 0xFF00FFFFu : 0xFFFFFFFFu;
-        if (i == g_menu_sel) osd_text(fb, stride, px + 14, ty, col, scale, ">");
-        osd_text(fb, stride, tx, ty, col, scale, line);
+        if (i == g_menu_sel) osd_text(fb, stride, FB_H, px + 14, ty, col, scale, ">");
+        osd_text(fb, stride, FB_H, tx, ty, col, scale, line);
         ty += lh;
     }
-    osd_text(fb, stride, tx, py + ph - 26, 0xFF888888u, 2,
-             "UP/DOWN move   A select   B back   ZR close");
+
+    if (g_menu_level == 3) {
+        osd_text(fb, stride, FB_H, tx, py + ph - 26, 0xFF888888u, 2,
+                 "LEFT/RIGHT change   B back   * Hardware Accel needs a restart");
+    } else {
+        osd_text(fb, stride, FB_H, tx, py + ph - 26, 0xFF888888u, 2,
+                 "UP/DOWN move   A select   B back   ZR close");
+    }
+
+    // Audio transport health, for chasing sound dropouts in the field. Note this
+    // necessarily reads low/draining: opening the menu pauses retro_run(), so no
+    // new audio is being submitted while you're looking at it (see the live HUD,
+    // toggled from Settings, for the buffer level during actual gameplay).
+    AudioStats as;
+    audio_stats(&as);
+    char diag[96];
+    snprintf(diag, sizeof(diag),
+             "audio: buf %ums  drop %u  fail %u (0x%x)  rebuild %u",
+             (as.ring_frames + as.inflight_frames) / 48,
+             as.drops, as.append_fails, as.last_err, as.reprimes);
+    osd_text(fb, stride, FB_H, px + 14, py + ph + 10, 0xFF888888u, 2, diag);
 }
 
-// Present the last game frame (+ menu overlay if open) to the display.
+// Draws the small live FPS/audio-buffer readout in the corner during gameplay
+// (menu closed). Same osd_rect/osd_text primitives as draw_menu, just a much
+// smaller panel that doesn't dim or pause anything. `canvas_h` lets this be
+// reused both on the real 1280x720 framebuffer (CPU path) and on the small,
+// tightly-sized HUD texture built for the GPU path.
+static void draw_hud(u32 *fb, u32 stride, u32 canvas_h, int x0, int y0) {
+    AudioStats as;
+    audio_stats(&as);
+    char line[48];
+    snprintf(line, sizeof(line), "FPS %u.%u  AUDIO %ums  LAG %u%%",
+             g_fps_x10 / 10, g_fps_x10 % 10, (as.ring_frames + as.inflight_frames) / 48,
+             g_lag_pct);
+
+    const int scale = 2;
+    int w = osd_text_w(line, scale) + 24, h = 8 * scale + 16;
+    osd_rect(fb, stride, canvas_h, x0, y0, w, h, 0xFF181818u);
+    osd_text(fb, stride, canvas_h, x0 + 12, y0 + 8, 0xFFFFFFFFu, scale, line);
+}
+
+// GPU-path only: builds the paused-menu backdrop (native-res frame nearest-
+// upscaled into the game window + draw_menu on top) into a full 1280x720
+// buffer, uploaded once as an opaque overlay replacement (see gpu_video.h).
+static void build_menu_frame(u32 *out) {
+    for (int i = 0; i < FB_W * FB_H; i++) out[i] = 0xFF000000u;  // pillarbox bars
+    if (g_native_w && g_native_h)
+        nn_upscale_rgba(out, FB_W, DST_X0, DST_Y0, DST_W, DST_H,
+                         g_native_frame, g_native_w, g_native_h);
+    draw_menu(out, FB_W);
+}
+
+// GPU-path only: HUD panel sized to its own small buffer (not the full
+// 1280x720 canvas), composited as a small quad by gpu_video.c — much cheaper
+// to re-upload every gameplay frame than the full-screen menu backdrop.
+// HUD_W/HUD_H come from gpu_video.h so both sides of the upload agree on size.
+static void build_hud_frame(u32 *out) {
+    draw_hud(out, HUD_W, HUD_H, 0, 0);
+}
+
+// Present the last game frame (+ menu overlay / HUD if applicable) to the display.
 static void present(void) {
+    if (g_use_gpu) {
+        if (g_menu_open) {
+            build_menu_frame(g_menu_frame);
+            gpu_video_set_overlay(g_menu_frame);
+        } else {
+            gpu_video_set_overlay(NULL);
+            if (g_settings.show_hud) {
+                build_hud_frame(g_hud_frame);
+                gpu_video_set_hud(g_hud_frame, HUD_W, HUD_H);
+            } else {
+                gpu_video_set_hud(NULL, 0, 0);
+            }
+        }
+        gpu_video_present();
+        return;
+    }
     u32 stride;
     u32 *out = (u32 *)framebufferBegin(&g_fb, &stride);
     const u32 row_px = stride / sizeof(u32);
@@ -335,16 +509,23 @@ static void present(void) {
         memcpy(out + (size_t)y * row_px, g_frame + (size_t)y * FB_W,
                FB_W * sizeof(u32));
     if (g_menu_open) draw_menu(out, row_px);
+    else if (g_settings.show_hud) draw_hud(out, row_px, FB_H, 16, 16);
     framebufferEnd(&g_fb);
 }
 
 // Handle a frame of input while the menu is open.
 static void menu_input(u64 down, bool *quit) {
-    int count = g_menu_level == 0 ? 4 : g_menu_level == 1 ? SLOT_COUNT : LOAD_COUNT;
+    int count = g_menu_level == 0 ? MAIN_COUNT
+              : g_menu_level == 1 ? SLOT_COUNT
+              : g_menu_level == 2 ? LOAD_COUNT : SETTINGS_COUNT;
     if (down & (HidNpadButton_Down | HidNpadButton_StickLDown))
         g_menu_sel = (g_menu_sel + 1) % count;
     if (down & (HidNpadButton_Up | HidNpadButton_StickLUp))
         g_menu_sel = (g_menu_sel + count - 1) % count;
+    if (g_menu_level == 3) {
+        if (down & (HidNpadButton_Left | HidNpadButton_StickLLeft)) settings_adjust(g_menu_sel, -1);
+        if (down & (HidNpadButton_Right | HidNpadButton_StickLRight)) settings_adjust(g_menu_sel, +1);
+    }
     if (down & HidNpadButton_ZR) { g_menu_open = false; return; }  // toggle close
     if (down & HidNpadButton_B) {
         if (g_menu_level == 0) g_menu_open = false;
@@ -356,17 +537,24 @@ static void menu_input(u64 down, bool *quit) {
             if (g_menu_sel == 0) g_menu_open = false;                       // Resume
             else if (g_menu_sel == 1) { g_menu_level = 1; g_menu_sel = 0; } // Save
             else if (g_menu_sel == 2) { g_menu_level = 2; g_menu_sel = 0; } // Load
+            else if (g_menu_sel == 3) {                                     // Reset
+                retro_reset();
+                g_menu_open = false;
+            }
+            else if (g_menu_sel == 4) { g_menu_level = 3; g_menu_sel = 0; } // Settings
             else *quit = true;                                             // Exit
         } else if (g_menu_level == 1) {
             char ext[16];
             snprintf(ext, sizeof(ext), "slot%d", g_menu_sel);
             state_save(ext);
             g_menu_open = false;
-        } else {
+        } else if (g_menu_level == 2) {
             char ext[16];
             load_ext(g_menu_sel, ext, sizeof(ext));
             state_load(ext);
             g_menu_open = false;
+        } else {
+            settings_adjust(g_menu_sel, +1);   // A cycles, same as RIGHT
         }
     }
 }
@@ -377,14 +565,30 @@ int main(int argc, char **argv) {
     padInitializeDefault(&pad);
 
     romfsInit();
+    save_io_init();
 
+    settings_load(&g_settings);
+    audio_preset_sync();
+
+    // GPU rendering is chosen once, at startup: gpu_video_init and the CPU
+    // Framebuffer both want exclusive ownership of the same NWindow, so there's
+    // no live swap between them (see settings.h — hw_accel takes effect on the
+    // next launch). Any failure inside gpu_video_init falls back to the CPU
+    // path automatically, so an unproven GPU path can never leave the app
+    // unable to boot.
     NWindow *win = nwindowGetDefault();
-    framebufferCreate(&g_fb, win, FB_W, FB_H, PIXEL_FORMAT_RGBA_8888, 2);
-    framebufferMakeLinear(&g_fb);
+    g_use_gpu = g_settings.hw_accel && gpu_video_init(win);
+    if (g_use_gpu) {
+        g_menu_frame = malloc((size_t)FB_W * FB_H * sizeof(u32));
+        g_hud_frame = malloc((size_t)HUD_W * HUD_H * sizeof(u32));
+    } else {
+        framebufferCreate(&g_fb, win, FB_W, FB_H, PIXEL_FORMAT_RGBA_8888, 2);
+        framebufferMakeLinear(&g_fb);
 
-    // Persistent frame (opaque black to start, incl. the side pillar-bars).
-    g_frame = malloc((size_t)FB_W * FB_H * sizeof(u32));
-    for (int i = 0; i < FB_W * FB_H; i++) g_frame[i] = 0xFF000000u;
+        // Persistent frame (opaque black to start, incl. the side pillar-bars).
+        g_frame = malloc((size_t)FB_W * FB_H * sizeof(u32));
+        for (int i = 0; i < FB_W * FB_H; i++) g_frame[i] = 0xFF000000u;
+    }
 
     retro_set_environment(environ_cb);
     retro_set_video_refresh(video_refresh);
@@ -400,7 +604,7 @@ int main(int argc, char **argv) {
 
     struct retro_system_av_info av;
     retro_get_system_av_info(&av);
-    audio_init((unsigned)av.timing.sample_rate);
+    audio_init((unsigned)av.timing.sample_rate, g_settings.audio_buffer_ms);
 
     ensure_save_dir();
     sram_load();
@@ -424,6 +628,7 @@ int main(int argc, char **argv) {
         } else {
             g_held = padGetButtons(&pad);
             retro_run();                // advances the game, fills g_frame
+            fps_tick();                 // only counts real gameplay frames
             frame++;
             if (frame % 600 == 0)    sram_save();          // SRAM ~every 10s
             if (frame % 3600 == 0)   state_save("auto1");  // auto ~every 1 min
@@ -434,15 +639,24 @@ int main(int argc, char **argv) {
 
     sram_save();            // final flush on exit
     state_save("auto1");    // snapshot on exit so next launch resumes here
+    save_io_flush();        // these two must actually land before we exit
     retro_unload_game();
 cleanup:
+    save_io_exit();
     audio_exit();
     retro_deinit();
     free(g_rom);
-    free(g_frame);
     free(g_map_x);
     free(g_map_y);
-    framebufferClose(&g_fb);
+    free(g_native_frame);
+    if (g_use_gpu) {
+        gpu_video_exit();
+        free(g_menu_frame);
+        free(g_hud_frame);
+    } else {
+        free(g_frame);
+        framebufferClose(&g_fb);
+    }
     romfsExit();
     return 0;
 }
