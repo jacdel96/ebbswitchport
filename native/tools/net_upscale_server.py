@@ -199,6 +199,11 @@ def handle_client(sock, addr, psk_key, model, device):
                         # does NOT include network transit either direction; that's
                         # whatever gap the Switch itself measures around the whole round trip)
     comp_ratios = []   # compressed / original size of each response, for visibility
+    # Granular per-stage breakdown, since isolated single-threaded benchmarks
+    # (bench_realistic.py, bench_zlib.py) don't reproduce whatever the live
+    # multi-threaded server process actually does — this measures the real
+    # thing instead of guessing from a synthetic replica.
+    stage_times = {"decompress": [], "convert+xfer": [], "forward": [], "postprocess": [], "compress": [], "send": []}
     try:
         while True:
             msg = channel.recv()
@@ -209,9 +214,12 @@ def handle_client(sock, addr, psk_key, model, device):
             if len(luma_bytes) != ulen or len(luma_bytes) != w * h:
                 raise ValueError(f"expected {w*h} luma bytes, got {len(luma_bytes)} (ulen={ulen})")
             luma = np.frombuffer(luma_bytes, dtype=np.uint8)
+            t_decompress_done = time.perf_counter()
 
             x = torch.from_numpy(luma.reshape(1, 1, h, w).astype(np.float32) / 255.0)
             x = x.to(device)
+            t_convert_done = time.perf_counter()
+
             with torch.no_grad():
                 y = model(x)
                 if device.type == "mps":
@@ -221,10 +229,13 @@ def handle_client(sock, addr, psk_key, model, device):
             out = (y.clamp(0, 1) * 255.0).round().to(torch.uint8).cpu().numpy()
             out_h, out_w = out.shape[2], out.shape[3]
             out_bytes = out.tobytes()
+            t_postprocess_done = time.perf_counter()
+
             # level 1: fastest setting — we have compute headroom (inference
             # is ~9ms) to spend a few ms shrinking what's actually the
             # dominant cost, the WiFi transfer of this response.
             comp = zlib.compress(out_bytes, level=1)
+            t_compress_done = time.perf_counter()
 
             reply = struct.pack("<HHI", out_w, out_h, len(out_bytes)) + comp
             channel.send(reply)
@@ -234,6 +245,12 @@ def handle_client(sock, addr, psk_key, model, device):
             infer_times.append((t_infer_done - t_recv_done) * 1000)
             total_times.append((t_send_done - t_recv_done) * 1000)
             comp_ratios.append(len(comp) / len(out_bytes))
+            stage_times["decompress"].append((t_decompress_done - t_recv_done) * 1000)
+            stage_times["convert+xfer"].append((t_convert_done - t_decompress_done) * 1000)
+            stage_times["forward"].append((t_infer_done - t_convert_done) * 1000)
+            stage_times["postprocess"].append((t_postprocess_done - t_infer_done) * 1000)
+            stage_times["compress"].append((t_compress_done - t_postprocess_done) * 1000)
+            stage_times["send"].append((t_send_done - t_compress_done) * 1000)
             if len(infer_times) >= STATS_WINDOW:
                 print(f"[t] {addr}: last {STATS_WINDOW} frames — "
                       f"inference avg/min/max: {sum(infer_times)/len(infer_times):.2f}/"
@@ -241,6 +258,10 @@ def handle_client(sock, addr, psk_key, model, device):
                       f"server-side total avg/min/max: {sum(total_times)/len(total_times):.2f}/"
                       f"{min(total_times):.2f}/{max(total_times):.2f}ms (excludes network transit), "
                       f"response compressed to {sum(comp_ratios)/len(comp_ratios)*100:.0f}% of original size avg")
+                breakdown = ", ".join(f"{k} {sum(v)/len(v):.2f}ms" for k, v in stage_times.items())
+                print(f"[t] {addr}: stage breakdown (avg) — {breakdown}")
+                for v in stage_times.values():
+                    v.clear()
                 infer_times.clear()
                 total_times.clear()
                 comp_ratios.clear()
