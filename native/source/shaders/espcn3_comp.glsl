@@ -36,21 +36,47 @@ vec3 ycbcr_to_rgb(float y, float cb, float cr) {
     return clamp(vec3(r, g, b), 0.0, 1.0);
 }
 
+// Workgroup-shared tile: an 8x8 workgroup's 3x3-conv footprint spans a 10x10
+// halo region, all 32 feat2 channels — cooperatively loaded ONCE per
+// workgroup instead of every thread independently re-fetching its own
+// neighborhood from the (7.3MB) feat2 buffer.
+const int HALO = 1;
+const int TILE = 8 + 2 * HALO;  // 10
+const int IC = 32;
+const int TILE2 = TILE * TILE;
+shared float sharedFeat2[IC * TILE2];  // flat, 32*10*10*4B = 12.8KB — see
+                                        // espcn2_comp.glsl for why flat, not 3D.
+
 void main() {
     ivec2 p = ivec2(gl_GlobalInvocationID.xy);
     ivec2 sz = ivec2(dims.size);
+    ivec2 localId = ivec2(gl_LocalInvocationID.xy);
+    ivec2 tileBase = p - localId;
+
+    int li = int(gl_LocalInvocationIndex);
+    int total = IC * TILE2;
+    for (int idx = li; idx < total; idx += 64) {
+        int ic = idx / TILE2;
+        int rem = idx % TILE2;
+        int ty = rem / TILE, tx = rem % TILE;
+        sharedFeat2[idx] = feat2_at(ic, tileBase + ivec2(tx - HALO, ty - HALO), sz);
+    }
+    barrier();
+
     if (p.x >= sz.x || p.y >= sz.y) return;
 
     // Each (ic, ky, kx) feat2 value is shared by all 9 output channels — loop
     // it on the outside and accumulate into all 9 channels per read, instead
-    // of re-reading it once per channel (9x fewer feat2 buffer reads).
+    // of re-reading it once per channel (9x fewer feat2 reads on top of the
+    // cross-thread sharing above).
     float outc[9];
     for (int oc = 0; oc < 9; oc++) outc[oc] = w[B3_OFF + oc];
 
     for (int ic = 0; ic < 32; ic++) {
         for (int ky = -1; ky <= 1; ky++) {
             for (int kx = -1; kx <= 1; kx++) {
-                float v = feat2_at(ic, p + ivec2(kx, ky), sz);
+                int sidx = ic * TILE2 + (localId.y + ky + HALO) * TILE + (localId.x + kx + HALO);
+                float v = sharedFeat2[sidx];
                 int kidx = (ky + 1) * 3 + (kx + 1);
                 for (int oc = 0; oc < 9; oc++) {
                     int widx = W3_OFF + oc * 32 * 9 + ic * 9 + kidx;
