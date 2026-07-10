@@ -54,12 +54,14 @@ LDFLAGS  = -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $
 # it's verified working, to switch to the release lib.
 DEKO3D_DEBUG ?= 1
 # mbedtls{,x509,crypto} (switch-mbedtls portlib) — ChaCha20-Poly1305/HKDF/HMAC
-# for the experimental network AI-upscale offload (net_upscale.c). Link order
-# matters: mbedtls depends on mbedx509, which depends on mbedcrypto.
+# for the experimental network AI-upscale offload (net_upscale.c). zstd
+# (switch-libzstd portlib) — response decompression, faster than zlib on
+# both compress and decompress for this data (see net_upscale_server.py).
+# Link order matters: mbedtls depends on mbedx509, which depends on mbedcrypto.
 ifeq ($(DEKO3D_DEBUG),1)
-LIBS := -ldeko3dd -lsnes9x_libretro_libnx -lmbedtls -lmbedx509 -lmbedcrypto -lz -lstdc++ -lnx -lm
+LIBS := -ldeko3dd -lsnes9x_libretro_libnx -lmbedtls -lmbedx509 -lmbedcrypto -lzstd -lstdc++ -lnx -lm
 else
-LIBS := -ldeko3d -lsnes9x_libretro_libnx -lmbedtls -lmbedx509 -lmbedcrypto -lz -lstdc++ -lnx -lm
+LIBS := -ldeko3d -lsnes9x_libretro_libnx -lmbedtls -lmbedx509 -lmbedcrypto -lzstd -lstdc++ -lnx -lm
 endif
 
 # lib search: native/lib (core) + libnx.

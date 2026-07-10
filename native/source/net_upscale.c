@@ -17,7 +17,7 @@
 #include <mbedtls/chachapoly.h>
 #include <mbedtls/hkdf.h>
 #include <mbedtls/md.h>
-#include <zlib.h>
+#include <zstd.h>
 
 #define CHALLENGE_LEN 16
 #define HMAC_LEN 32
@@ -367,9 +367,11 @@ static void net_thread_func(void *arg) {
             uint32_t recv_ulen; memcpy(&recv_ulen, s_recv_buf + 4, 4);
             if (ow > MAX_OUT_W || oh > MAX_OUT_H || recv_ulen != (uint32_t)ow * oh) break;
 
-            uLongf out_len = sizeof(s_decompressed);
-            if (uncompress(s_decompressed, &out_len, s_recv_buf + 8, (uLong)(n - 8)) != Z_OK) break;
-            if (out_len != recv_ulen) break;
+            // zstd, not zlib — ~3x faster to compress on the server AND a
+            // couple points smaller, measured directly against zlib on real
+            // response data (see net_upscale_server.py's comment).
+            size_t out_len = ZSTD_decompress(s_decompressed, sizeof(s_decompressed), s_recv_buf + 8, (size_t)(n - 8));
+            if (ZSTD_isError(out_len) || out_len != recv_ulen) break;
 
             g_last_rtt_us = (unsigned)(armTicksToNs(armGetSystemTick() - t0) / 1000);
 
