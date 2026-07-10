@@ -7,6 +7,7 @@
 #include <switch.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <poll.h>
@@ -232,6 +233,14 @@ static int connect_with_timeout(const char *host, uint16_t port, int timeout_ms)
         if (err != 0) { close(sock); return -1; }
     }
     fcntl(sock, F_SETFL, flags);  // back to blocking for the rest of the session
+
+    // Without this, Nagle's algorithm can hold small writes (like our
+    // request payloads) waiting to coalesce with more data, interacting
+    // badly with the peer's delayed-ACK timer — a well-known source of
+    // tens-of-ms added latency per round trip on exactly this kind of
+    // small-message request/response protocol.
+    int one = 1;
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     return sock;
 }
 

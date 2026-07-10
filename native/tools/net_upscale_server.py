@@ -246,6 +246,11 @@ def main():
     try:
         while True:
             sock, addr = srv.accept()
+            # Disable Nagle's algorithm — this is a tight request/response
+            # protocol (one small request, wait for one response), and Nagle
+            # + the peer's delayed-ACK timer is a well-known source of
+            # tens-of-ms added latency per round trip otherwise.
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             t = threading.Thread(target=handle_client, args=(sock, addr, psk_key, model, device), daemon=True)
             t.start()
     except KeyboardInterrupt:
