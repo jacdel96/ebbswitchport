@@ -53,8 +53,8 @@ static u32 *g_frame = NULL;
 #define SLOT_COUNT 10            // manual slots 0..9
 #define LOAD_COUNT (SLOT_COUNT + 2)  // + auto1 + auto10
 #define MAIN_COUNT 6             // Resume/Save/Load/Reset/Settings/Exit
-#define SETTINGS_COUNT 7         // Hardware Accel/Audio Buffer/Show HUD/Dynamic Overclock/
-                                  // OC Trigger/OC Boost/CRT Mode
+#define SETTINGS_COUNT 8         // Hardware Accel/Audio Buffer/Show HUD/Dynamic Overclock/
+                                  // OC Trigger/OC Boost/CRT Mode/AI Upscale
 static bool g_menu_open = false;
 static int g_menu_level = 0;
 static int g_menu_sel = 0;
@@ -173,6 +173,28 @@ static void run_timing_tick(unsigned us) {
     g_run_us_sum = 0;
     g_run_us_count = 0;
     g_run_us_window_max = 0;
+}
+
+// Same windowing as run_timing_tick, for the experimental AI (ESPCN) upscale
+// pass — see gpu_video_get_ai_upscale_us's comment. Only ticked on frames it
+// actually ran, so the average reflects real dispatch cost, not diluted by
+// frames where it was skipped (menu closed vs open, resolution out of range).
+static unsigned long long g_ai_us_sum = 0;
+static unsigned g_ai_us_count = 0;
+static unsigned g_ai_us_window_max = 0;
+static unsigned g_ai_avg_us = 0;
+static unsigned g_ai_max_us = 0;
+
+static void ai_timing_tick(unsigned us) {
+    g_ai_us_sum += us;
+    g_ai_us_count++;
+    if (us > g_ai_us_window_max) g_ai_us_window_max = us;
+    if (g_ai_us_count < 30) return;
+    g_ai_avg_us = (unsigned)(g_ai_us_sum / g_ai_us_count);
+    g_ai_max_us = g_ai_us_window_max;
+    g_ai_us_sum = 0;
+    g_ai_us_count = 0;
+    g_ai_us_window_max = 0;
 }
 
 // --- rendering backend selection ---------------------------------------------
@@ -464,6 +486,9 @@ static void settings_adjust(int sel, int dir) {
     } else if (sel == 6) {
         g_settings.crt_mode = !g_settings.crt_mode;        // live (GPU path only)
         gpu_video_set_crt(g_settings.crt_mode);
+    } else if (sel == 7) {
+        g_settings.ai_upscale = !g_settings.ai_upscale;    // live (GPU path only; no-op if weights absent)
+        gpu_video_set_ai_upscale(g_settings.ai_upscale);
     }
     settings_save(&g_settings);
 }
@@ -507,8 +532,10 @@ static void draw_menu(u32 *fb, u32 stride) {
                                        g_settings.overclock_trigger_dupes);
             else if (i == 5) snprintf(line, sizeof(line), "%-16s %u frames", "OC Boost",
                                        g_settings.overclock_boost_frames);
-            else snprintf(line, sizeof(line), "%-16s %s", "CRT Mode",
-                          g_settings.crt_mode ? "On" : "Off");
+            else if (i == 6) snprintf(line, sizeof(line), "%-16s %s", "CRT Mode",
+                                       g_settings.crt_mode ? "On" : "Off");
+            else snprintf(line, sizeof(line), "%-16s %s", "AI Upscale",
+                          g_settings.ai_upscale ? "On" : "Off");
         } else {
             char ext[16];
             const char *name;
@@ -563,7 +590,8 @@ static void draw_menu(u32 *fb, u32 stride) {
 static void draw_hud(u32 *fb, u32 stride, u32 canvas_h, int x0, int y0) {
     AudioStats as;
     audio_stats(&as);
-    char line1[80], line2[48];
+    char line1[80], line2[48], line3[48];
+    bool ai_active = g_use_gpu && gpu_video_ai_upscale_active();
     // g_use_gpu reflects the backend actually running this session (settings
     // hw_accel is only the *request* — gpu_video_init may have failed and
     // silently fallen back to CPU, see main()'s init), not just the setting.
@@ -580,14 +608,26 @@ static void draw_hud(u32 *fb, u32 stride, u32 canvas_h, int x0, int y0) {
     unsigned avg_x10 = g_run_avg_us / 100, max_x10 = g_run_max_us / 100;  // tenths of a ms
     snprintf(line2, sizeof(line2), "RUN avg %u.%ums  max %u.%ums",
              avg_x10 / 10, avg_x10 % 10, max_x10 / 10, max_x10 % 10);
+    // Experimental AI (ESPCN) upscale timing — only shown while it's actually
+    // running (GPU path, weights present, enabled, resolution in range).
+    if (ai_active) {
+        unsigned ai_avg_x10 = g_ai_avg_us / 100, ai_max_x10 = g_ai_max_us / 100;
+        snprintf(line3, sizeof(line3), "AI avg %u.%ums  max %u.%ums",
+                 ai_avg_x10 / 10, ai_avg_x10 % 10, ai_max_x10 / 10, ai_max_x10 % 10);
+    }
 
     const int scale = 2;
     int lh = 8 * scale + 6;
     int w1 = osd_text_w(line1, scale), w2 = osd_text_w(line2, scale);
-    int w = (w1 > w2 ? w1 : w2) + 24, h = lh * 2 + 12;
+    int w3 = ai_active ? osd_text_w(line3, scale) : 0;
+    int wmax = w1 > w2 ? w1 : w2;
+    if (w3 > wmax) wmax = w3;
+    int lines = ai_active ? 3 : 2;
+    int w = wmax + 24, h = lh * lines + 12;
     osd_rect(fb, stride, canvas_h, x0, y0, w, h, 0xFF181818u);
     osd_text(fb, stride, canvas_h, x0 + 12, y0 + 6, 0xFFFFFFFFu, scale, line1);
     osd_text(fb, stride, canvas_h, x0 + 12, y0 + 6 + lh, 0xFFFFFFFFu, scale, line2);
+    if (ai_active) osd_text(fb, stride, canvas_h, x0 + 12, y0 + 6 + lh * 2, 0xFFFFFFFFu, scale, line3);
 }
 
 // GPU-path only: builds the paused-menu backdrop (native-res frame nearest-
@@ -624,7 +664,9 @@ static void present(void) {
                 gpu_video_set_hud(NULL, 0, 0);
             }
         }
+        bool ai_ran = gpu_video_ai_upscale_active();
         gpu_video_present();
+        if (ai_ran) ai_timing_tick(gpu_video_get_ai_upscale_us());
         return;
     }
     u32 stride;
@@ -707,6 +749,7 @@ int main(int argc, char **argv) {
         g_menu_frame = malloc((size_t)FB_W * FB_H * sizeof(u32));
         g_hud_frame = malloc((size_t)HUD_W * HUD_H * sizeof(u32));
         gpu_video_set_crt(g_settings.crt_mode);
+        gpu_video_set_ai_upscale(g_settings.ai_upscale);
     } else {
         framebufferCreate(&g_fb, win, FB_W, FB_H, PIXEL_FORMAT_RGBA_8888, 2);
         framebufferMakeLinear(&g_fb);

@@ -17,9 +17,10 @@
 // The small HUD panel's fixed pixel size (shared with main.c, which builds the
 // panel's pixels via osd_rect/osd_text before handing them to gpu_video_set_hud).
 // Wide enough for "GPU 1920x1080  FPS 60.0  AUDIO 100ms  LAG 100%  OC" at
-// scale 2 plus padding; tall enough for that plus a second "RUN avg/max" line.
-#define HUD_W 700
-#define HUD_H 64
+// scale 2 plus padding; tall enough for that plus "RUN avg/max" and (when the
+// experimental AI upscale is active) a third "AI avg/max" line.
+#define HUD_W 860
+#define HUD_H 80
 
 bool gpu_video_init(NWindow *win);
 
@@ -46,6 +47,15 @@ void gpu_video_set_crt(bool enabled);
 // live — see resize_swapchain in gpu_video.c). Defaults to 1280x720 if called
 // before gpu_video_init.
 void gpu_video_get_resolution(unsigned *w, unsigned *h);
+
+// Experimental AI (ESPCN) upscale — see the research memo. Best-effort: only
+// does anything if a local, unshipped weights file was present in romfs at
+// init (gpu_video_ai_upscale_active() reports whether it's actually running
+// this frame — the weights file, the enabled setting, AND the core's current
+// resolution fitting within the model's supported size all have to hold).
+void gpu_video_set_ai_upscale(bool enabled);
+bool gpu_video_ai_upscale_active(void);
+unsigned gpu_video_get_ai_upscale_us(void);  // last dispatch's wall-clock cost, 0 if it didn't run
 
 // Uploads whatever changed since the last call, draws, and presents. Call once
 // per main-loop iteration, whether or not a new game frame arrived that tick

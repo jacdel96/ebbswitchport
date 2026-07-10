@@ -133,6 +133,10 @@ $(ROMFS_SHADERS)/%_vsh.dksh: %_vsh.glsl
 $(ROMFS_SHADERS)/%_fsh.dksh: %_fsh.glsl
 	@echo {frag} $(notdir $<)
 	@uam -s frag -o $@ $<
+
+$(ROMFS_SHADERS)/%_comp.dksh: %_comp.glsl
+	@echo {comp} $(notdir $<)
+	@uam -s comp -o $@ $<
 endif
 
 clean:

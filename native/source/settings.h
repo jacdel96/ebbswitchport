@@ -15,6 +15,9 @@ typedef struct {
     unsigned overclock_boost_frames;  // how long a boost lasts once (re)armed
     bool     crt_mode;         // scanlines/phosphor mask/vignette on the game
                                 // quad; GPU-path only (no-op on CPU path), live
+    bool     ai_upscale;       // experimental ESPCN super-resolution on the game quad;
+                                // GPU-path only, only does anything if a local (unshipped,
+                                // see gpu_video.h) weights file is present; default off
 } Settings;
 
 // Fills *out with defaults, then overrides from sdmc:/switch/ebbswitchport/settings.cfg

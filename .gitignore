@@ -4,6 +4,11 @@ roms/
 *.smc
 *.nro
 
+# Experimental AI-upscale weights (native/source/shaders/espcn*_comp.glsl) —
+# unresolved licensing on the source checkpoint, see the research memo.
+# Local-only until that's resolved; never commit or ship.
+native/romfs/ai/
+
 # Native NRO build artifacts (the .nro embeds the ROM)
 native/build/
 native/build-out/

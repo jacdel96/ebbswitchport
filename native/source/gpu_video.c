@@ -48,12 +48,42 @@ static void compute_dst_layout(void) {
 #define N_FB       2   // swapchain depth
 #define N_PARITY   2   // scratch double-buffering depth
 
-#define CODE_MEM_SIZE (64 * 1024)
+// The three ESPCN compute shaders unroll deeply (32x64x9 / 9x32x9 nested
+// loops), producing far larger compiled shader binaries than the tiny
+// vertex/fragment shaders elsewhere in this file (hundreds of KB each,
+// checked at build time) — 64KB was fine before, nowhere near enough now.
+#define CODE_MEM_SIZE (2 * 1024 * 1024)
 #define CMD_MEM_SIZE  (64 * 1024)
 
 // Image descriptor slots (indices into the bound image descriptor set).
-enum { IMG_GAME = 0, IMG_HUD = 1, IMG_OVERLAY = 2, IMG_COUNT = 3 };
+// IMG_ESPCN_OUT serves double duty: written via plain image load/store by
+// espcn3_comp (dkMakeImageHandle) and later sampled as an ordinary texture
+// for the game-quad draw (dkMakeTextureHandle) — same descriptor slot, two
+// different handle constructors, per deko3d's shared image descriptor model.
+enum { IMG_GAME = 0, IMG_HUD = 1, IMG_OVERLAY = 2, IMG_ESPCN_OUT = 3, IMG_COUNT = 4 };
 #define SAMPLER_SLOT 0
+
+// --- experimental AI upscale (ESPCN) — see the research memo -----------------
+// Optional, best-effort: only enabled if a local (gitignored, unshipped —
+// licensing is unresolved, see settings.h) weights file is present in romfs.
+// Its absence is NOT a gpu_video_init failure; every other GPU feature works
+// identically whether or not this is available.
+#define ESPCN_SCALE 3
+#define ESPCN_MAX_W 256   // standard SNES resolution + small headroom; hi-res
+#define ESPCN_MAX_H 240   // core modes exceeding this just skip AI upscale that frame
+#define ESPCN_WEIGHTS_PATH "romfs:/ai/espcn_x3.bin"
+// Byte offsets into the weight blob (payload only — the 56-byte file header
+// with magic/scale/dims is skipped on load), matching native's
+// package_espcn_weights.py output exactly and mirrored in the espcn*_comp.glsl
+// shaders' W1_OFF/B1_OFF/etc constants.
+#define ESPCN_W1_COUNT (64 * 1 * 5 * 5)
+#define ESPCN_B1_COUNT 64
+#define ESPCN_W2_COUNT (32 * 64 * 3 * 3)
+#define ESPCN_B2_COUNT 32
+#define ESPCN_W3_COUNT (9 * 32 * 3 * 3)
+#define ESPCN_B3_COUNT 9
+#define ESPCN_WEIGHTS_FLOATS (ESPCN_W1_COUNT + ESPCN_B1_COUNT + ESPCN_W2_COUNT + \
+                               ESPCN_B2_COUNT + ESPCN_W3_COUNT + ESPCN_B3_COUNT)
 
 static inline uint32_t align_up(uint32_t v, uint32_t a) { return (v + a - 1) & ~(a - 1); }
 
@@ -96,9 +126,21 @@ static DkMemBlock g_hudScratch[N_PARITY];
 static DkMemBlock g_overlayScratch[N_PARITY];
 static unsigned g_parity = 0;
 
-static DkMemBlock g_descMemBlock;   // 3 image descriptors + 1 sampler descriptor
+static DkMemBlock g_descMemBlock;   // 4 image descriptors + 1 sampler descriptor
 #define DESC_IMG_OFFSET(slot) ((slot) * DK_IMAGE_DESCRIPTOR_ALIGNMENT)
 #define DESC_SAMPLER_OFFSET   256
+
+// --- ESPCN state ---------------------------------------------------------------
+static bool g_espcn_available = false;  // weights present + all resources allocated OK
+static bool g_espcn_enabled = false;    // user setting (gpu_video_set_ai_upscale)
+static DkShader g_espcn1, g_espcn2, g_espcn3;
+static DkMemBlock g_espcnWeights;       // SSBO: raw weight/bias blob (read-only)
+static DkMemBlock g_espcnDimsUbo;       // UBO: current native W,H (as uvec2, std140-padded)
+static DkMemBlock g_espcnFeat1Mem;      // SSBO: 64 x ESPCN_MAX_H x ESPCN_MAX_W floats
+static DkMemBlock g_espcnFeat2Mem;      // SSBO: 32 x ESPCN_MAX_H x ESPCN_MAX_W floats
+static DkMemBlock g_espcnOutImgMem;
+static DkImage g_espcnOutImage;         // (ESPCN_MAX_W*3) x (ESPCN_MAX_H*3), load/store + sampled
+static unsigned g_espcn_last_us = 0;    // wall-clock time of the last dispatch, for the HUD
 
 static DkMemBlock g_cmdbufMemBlock;
 static DkCmdBuf g_cmdbuf;
@@ -197,6 +239,11 @@ static void teardown(void) {
     if (g_overlayImgMem) dkMemBlockDestroy(g_overlayImgMem);
     if (g_hudImgMem) dkMemBlockDestroy(g_hudImgMem);
     if (g_gameImgMem) dkMemBlockDestroy(g_gameImgMem);
+    if (g_espcnOutImgMem) dkMemBlockDestroy(g_espcnOutImgMem);
+    if (g_espcnFeat1Mem) dkMemBlockDestroy(g_espcnFeat1Mem);
+    if (g_espcnFeat2Mem) dkMemBlockDestroy(g_espcnFeat2Mem);
+    if (g_espcnDimsUbo) dkMemBlockDestroy(g_espcnDimsUbo);
+    if (g_espcnWeights) dkMemBlockDestroy(g_espcnWeights);
     if (g_codeMemBlock) dkMemBlockDestroy(g_codeMemBlock);
     if (g_swapchain) dkSwapchainDestroy(g_swapchain);
     if (g_fbMemBlock) dkMemBlockDestroy(g_fbMemBlock);
@@ -208,6 +255,8 @@ static void teardown(void) {
     g_swapchain = NULL;
     g_codeMemBlock = NULL;
     g_gameImgMem = g_hudImgMem = g_overlayImgMem = NULL;
+    g_espcnOutImgMem = g_espcnFeat1Mem = g_espcnFeat2Mem = g_espcnDimsUbo = g_espcnWeights = NULL;
+    g_espcn_available = false;
     memset(g_gameScratch, 0, sizeof(g_gameScratch));
     memset(g_hudScratch, 0, sizeof(g_hudScratch));
     memset(g_overlayScratch, 0, sizeof(g_overlayScratch));
@@ -215,6 +264,8 @@ static void teardown(void) {
     g_cmdbufMemBlock = NULL;
     g_cmdbuf = NULL;
 }
+
+static bool try_init_espcn(void);  // defined below; called from gpu_video_init
 
 bool gpu_video_init(NWindow *win) {
     g_device = NULL;
@@ -234,6 +285,10 @@ bool gpu_video_init(NWindow *win) {
     g_crt_enabled = false;
     g_game_pending = g_hud_pending = g_overlay_pending = false;
     g_parity = 0;
+    g_espcn_available = false;
+    g_espcn_enabled = false;
+    g_espcnWeights = g_espcnDimsUbo = g_espcnFeat1Mem = g_espcnFeat2Mem = g_espcnOutImgMem = NULL;
+    g_espcn_last_us = 0;
     g_win = win;
     resolution_for_mode(&g_fb_w, &g_fb_h);  // start at whatever mode we're already in
     compute_dst_layout();
@@ -245,7 +300,10 @@ bool gpu_video_init(NWindow *win) {
 
     DkQueueMaker qMaker;
     dkQueueMakerDefaults(&qMaker, g_device);
-    qMaker.flags = DkQueueFlags_Graphics;
+    // Compute must be explicitly requested — dkQueueMakerDefaults already
+    // includes it, but the original (pre-ESPCN) code here overwrote flags
+    // with Graphics only, silently dropping it.
+    qMaker.flags = DkQueueFlags_Graphics | DkQueueFlags_Compute;
     g_queue = dkQueueCreate(&qMaker);
     if (!g_queue) { teardown(); return false; }
 
@@ -319,6 +377,10 @@ bool gpu_video_init(NWindow *win) {
     DkSamplerDescriptor sdesc;
     dkSamplerDescriptorInitialize(&sdesc, &sampler);
     memcpy((uint8_t *)dkMemBlockGetCpuAddr(g_descMemBlock) + DESC_SAMPLER_OFFSET, &sdesc, sizeof(sdesc));
+
+    // Experimental AI upscale — optional, see try_init_espcn's comment. Its
+    // absence is not a gpu_video_init failure.
+    g_espcn_available = try_init_espcn();
 
     // Command buffer, reused (cleared + re-recorded) every present().
     g_cmdbufMemBlock = make_memblock(CMD_MEM_SIZE, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
@@ -403,6 +465,67 @@ static void draw_textured_quad(unsigned slot, int x, int y, int w, int h) {
     dkCmdBufDraw(g_cmdbuf, DkPrimitive_TriangleStrip, 4, 1, 0, 0);
 }
 
+// Best-effort: loads a local, gitignored weights file (see settings.h — the
+// pretrained weights' license is unresolved, so this is never shipped; its
+// absence here is the normal case for anyone besides local development) and,
+// only if present, allocates everything the ESPCN compute passes need.
+// Failure at any point cleans up whatever THIS function allocated and leaves
+// g_espcn_available false — every other GPU feature works identically
+// whether or not this succeeds, since it's never on the teardown()/fatal path.
+static bool try_init_espcn(void) {
+    FILE *f = fopen(ESPCN_WEIGHTS_PATH, "rb");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 56, SEEK_SET);  // skip magic(4)+scale(4)+3x dims(4x4 each) header
+    long payload = fsize - 56;
+    if (payload != (long)(ESPCN_WEIGHTS_FLOATS * sizeof(float))) { fclose(f); return false; }
+
+    if (!load_shader(&g_espcn1, "romfs:/shaders/espcn1_comp.dksh") ||
+        !load_shader(&g_espcn2, "romfs:/shaders/espcn2_comp.dksh") ||
+        !load_shader(&g_espcn3, "romfs:/shaders/espcn3_comp.dksh")) {
+        fclose(f);
+        return false;
+    }
+
+    g_espcnWeights = make_memblock(ESPCN_WEIGHTS_FLOATS * sizeof(float),
+                                    DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
+    if (!g_espcnWeights) { fclose(f); return false; }
+    bool ok = fread(dkMemBlockGetCpuAddr(g_espcnWeights), 1, (size_t)payload, f) == (size_t)payload;
+    fclose(f);
+    if (!ok) { dkMemBlockDestroy(g_espcnWeights); g_espcnWeights = NULL; return false; }
+
+    g_espcnDimsUbo = make_memblock(DK_UNIFORM_BUF_ALIGNMENT,
+                                    DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
+    if (!g_espcnDimsUbo) { dkMemBlockDestroy(g_espcnWeights); g_espcnWeights = NULL; return false; }
+
+    uint32_t feat1Size = 64u * ESPCN_MAX_H * ESPCN_MAX_W * sizeof(float);
+    uint32_t feat2Size = 32u * ESPCN_MAX_H * ESPCN_MAX_W * sizeof(float);
+    g_espcnFeat1Mem = make_memblock(feat1Size, DkMemBlockFlags_GpuCached);
+    g_espcnFeat2Mem = make_memblock(feat2Size, DkMemBlockFlags_GpuCached);
+    if (!g_espcnFeat1Mem || !g_espcnFeat2Mem) {
+        if (g_espcnFeat1Mem) dkMemBlockDestroy(g_espcnFeat1Mem);
+        if (g_espcnFeat2Mem) dkMemBlockDestroy(g_espcnFeat2Mem);
+        g_espcnFeat1Mem = g_espcnFeat2Mem = NULL;
+        dkMemBlockDestroy(g_espcnDimsUbo); g_espcnDimsUbo = NULL;
+        dkMemBlockDestroy(g_espcnWeights); g_espcnWeights = NULL;
+        return false;
+    }
+
+    if (!init_or_resize_image(&g_espcnOutImage, &g_espcnOutImgMem,
+                               ESPCN_MAX_W * ESPCN_SCALE, ESPCN_MAX_H * ESPCN_SCALE,
+                               ESPCN_MAX_W * ESPCN_SCALE, ESPCN_MAX_H * ESPCN_SCALE,
+                               IMG_ESPCN_OUT, true, DkImageFlags_UsageLoadStore)) {
+        dkMemBlockDestroy(g_espcnFeat1Mem); g_espcnFeat1Mem = NULL;
+        dkMemBlockDestroy(g_espcnFeat2Mem); g_espcnFeat2Mem = NULL;
+        dkMemBlockDestroy(g_espcnDimsUbo); g_espcnDimsUbo = NULL;
+        dkMemBlockDestroy(g_espcnWeights); g_espcnWeights = NULL;
+        return false;
+    }
+
+    return true;
+}
+
 // Recreates the swapchain + its framebuffer images at new_w x new_h (a real
 // dock/handheld transition). Builds the new swapchain BEFORE touching the old
 // one, so a failure here (allocation, API error) just leaves the old
@@ -446,6 +569,90 @@ static void resize_swapchain(unsigned new_w, unsigned new_h) {
     compute_dst_layout();
 }
 
+void gpu_video_set_ai_upscale(bool enabled) {
+    if (!g_ready) return;
+    g_espcn_enabled = enabled;
+}
+
+bool gpu_video_ai_upscale_active(void) {
+    return g_espcn_available && g_espcn_enabled &&
+           g_game_w > 0 && g_game_w <= ESPCN_MAX_W && g_game_h <= ESPCN_MAX_H;
+}
+
+unsigned gpu_video_get_ai_upscale_us(void) {
+    return g_espcn_last_us;
+}
+
+// Runs the 3 ESPCN compute passes (espcn1/2/3_comp.glsl) against the current
+// game frame, writing the result to g_espcnOutImage. Deliberately its own
+// synchronous submission rather than folded into the main per-frame command
+// list: keeps its cost independently measurable (g_espcn_last_us, surfaced
+// via gpu_video_get_ai_upscale_us for the HUD) and avoids reasoning about
+// compute/graphics barriers sharing a single list for a first, unverified cut.
+static void run_espcn_upscale(void) {
+    u64 t0 = armGetSystemTick();
+
+    struct { uint32_t w, h; } dims = { g_game_w, g_game_h };
+    memcpy(dkMemBlockGetCpuAddr(g_espcnDimsUbo), &dims, sizeof(dims));
+
+    dkCmdBufClear(g_cmdbuf);
+    dkCmdBufAddMemory(g_cmdbuf, g_cmdbufMemBlock, 0, CMD_MEM_SIZE);
+
+    const uint32_t weightsBytes = ESPCN_WEIGHTS_FLOATS * sizeof(float);
+    const uint32_t feat1Bytes = 64u * ESPCN_MAX_H * ESPCN_MAX_W * sizeof(float);
+    const uint32_t feat2Bytes = 32u * ESPCN_MAX_H * ESPCN_MAX_W * sizeof(float);
+    const DkGpuAddr dimsAddr = dkMemBlockGetGpuAddr(g_espcnDimsUbo);
+    const DkGpuAddr weightsAddr = dkMemBlockGetGpuAddr(g_espcnWeights);
+    // Cross-stage producer/consumer barrier: combine both invalidate flags
+    // since it's unverified whether SSBO traffic goes through the same cache
+    // path as the image/texture barriers used elsewhere in this file — extra
+    // invalidation is wasted cycles at worst, never incorrect.
+    const uint32_t barrierFlags = DkInvalidateFlags_L2Cache | DkInvalidateFlags_Image;
+    unsigned gx = (g_game_w + 7) / 8, gy = (g_game_h + 7) / 8;
+
+    // Layer 1: source RGB (luma extracted in-shader) -> feat1 (64ch)
+    DkShader const *l1[] = { &g_espcn1 };
+    dkCmdBufBindShaders(g_cmdbuf, DkStageFlag_Compute, l1, 1);
+    dkCmdBufBindTexture(g_cmdbuf, DkStage_Compute, 0, dkMakeTextureHandle(IMG_GAME, SAMPLER_SLOT));
+    dkCmdBufBindUniformBuffer(g_cmdbuf, DkStage_Compute, 0, dimsAddr, DK_UNIFORM_BUF_ALIGNMENT);
+    dkCmdBufBindStorageBuffer(g_cmdbuf, DkStage_Compute, 0, weightsAddr, weightsBytes);
+    dkCmdBufBindStorageBuffer(g_cmdbuf, DkStage_Compute, 1, dkMemBlockGetGpuAddr(g_espcnFeat1Mem), feat1Bytes);
+    dkCmdBufDispatchCompute(g_cmdbuf, gx, gy, 1);
+    dkCmdBufBarrier(g_cmdbuf, DkBarrier_Full, barrierFlags);
+
+    // Layer 2: feat1 (64ch) -> feat2 (32ch)
+    DkShader const *l2[] = { &g_espcn2 };
+    dkCmdBufBindShaders(g_cmdbuf, DkStageFlag_Compute, l2, 1);
+    dkCmdBufBindUniformBuffer(g_cmdbuf, DkStage_Compute, 0, dimsAddr, DK_UNIFORM_BUF_ALIGNMENT);
+    dkCmdBufBindStorageBuffer(g_cmdbuf, DkStage_Compute, 0, weightsAddr, weightsBytes);
+    dkCmdBufBindStorageBuffer(g_cmdbuf, DkStage_Compute, 1, dkMemBlockGetGpuAddr(g_espcnFeat1Mem), feat1Bytes);
+    dkCmdBufBindStorageBuffer(g_cmdbuf, DkStage_Compute, 2, dkMemBlockGetGpuAddr(g_espcnFeat2Mem), feat2Bytes);
+    dkCmdBufDispatchCompute(g_cmdbuf, gx, gy, 1);
+    dkCmdBufBarrier(g_cmdbuf, DkBarrier_Full, barrierFlags);
+
+    // Layer 3 + pixel shuffle + YCbCr recombine -> g_espcnOutImage (3x size)
+    DkShader const *l3[] = { &g_espcn3 };
+    dkCmdBufBindShaders(g_cmdbuf, DkStageFlag_Compute, l3, 1);
+    dkCmdBufBindTexture(g_cmdbuf, DkStage_Compute, 0, dkMakeTextureHandle(IMG_GAME, SAMPLER_SLOT));
+    dkCmdBufBindImage(g_cmdbuf, DkStage_Compute, 0, dkMakeImageHandle(IMG_ESPCN_OUT));
+    dkCmdBufBindUniformBuffer(g_cmdbuf, DkStage_Compute, 0, dimsAddr, DK_UNIFORM_BUF_ALIGNMENT);
+    dkCmdBufBindStorageBuffer(g_cmdbuf, DkStage_Compute, 0, weightsAddr, weightsBytes);
+    dkCmdBufBindStorageBuffer(g_cmdbuf, DkStage_Compute, 1, dkMemBlockGetGpuAddr(g_espcnFeat2Mem), feat2Bytes);
+    dkCmdBufDispatchCompute(g_cmdbuf, gx, gy, 1);
+    // This barrier matters more than the previous two: the very next thing
+    // that happens is the main draw sampling g_espcnOutImage as a texture.
+    dkCmdBufBarrier(g_cmdbuf, DkBarrier_Full, barrierFlags);
+
+    DkCmdList list = dkCmdBufFinishList(g_cmdbuf);
+    dkQueueSubmitCommands(g_queue, list);
+    dkQueueWaitIdle(g_queue);  // isolates the timing measurement; also leaves
+                               // the queue idle before the main cmdbuf below
+                               // reuses g_cmdbuf's memory, per the existing
+                               // clear+addMemory safety invariant.
+
+    g_espcn_last_us = (unsigned)(armTicksToNs(armGetSystemTick() - t0) / 1000);
+}
+
 void gpu_video_present(void) {
     if (!g_ready) return;
 
@@ -456,6 +663,9 @@ void gpu_video_present(void) {
     unsigned want_w, want_h;
     resolution_for_mode(&want_w, &want_h);
     if (want_w != g_fb_w || want_h != g_fb_h) resize_swapchain(want_w, want_h);
+
+    bool use_espcn = gpu_video_ai_upscale_active();
+    if (use_espcn) run_espcn_upscale();
 
     int slot = dkQueueAcquireImage(g_queue, g_swapchain);
 
@@ -518,7 +728,8 @@ void gpu_video_present(void) {
         // CRT look applies only to the game quad — HUD/menu overlay stay on
         // the plain shader, so rebind around just this draw.
         if (g_crt_enabled) dkCmdBufBindShaders(g_cmdbuf, DkStageFlag_GraphicsMask, crtShaders, 2);
-        draw_textured_quad(IMG_GAME, g_dst_x0, g_dst_y0, (int)g_dst_w, (int)g_dst_h);
+        unsigned gameSrc = use_espcn ? IMG_ESPCN_OUT : IMG_GAME;
+        draw_textured_quad(gameSrc, g_dst_x0, g_dst_y0, (int)g_dst_w, (int)g_dst_h);
         if (g_crt_enabled) dkCmdBufBindShaders(g_cmdbuf, DkStageFlag_GraphicsMask, plainShaders, 2);
     }
     if (g_hud_visible)
