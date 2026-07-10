@@ -25,39 +25,25 @@ float luma_padded(ivec2 p, ivec2 sz) {
     return dot(c, vec3(0.299, 0.587, 0.114));
 }
 
-// Workgroup-shared tile: an 8x8 workgroup's 5x5-conv footprint spans a 12x12
-// halo region (144 texels) — cooperatively load it ONCE per workgroup instead
-// of every one of the 64 threads independently re-fetching its own
-// (mostly-overlapping) 5x5 neighborhood from the srcImage texture unit.
-const int HALO = 2;
-const int TILE = 8 + 2 * HALO;  // 12
-shared float sharedLuma[TILE][TILE];
-
 void main() {
     ivec2 p = ivec2(gl_GlobalInvocationID.xy);
     ivec2 sz = ivec2(dims.size);
-    ivec2 localId = ivec2(gl_LocalInvocationID.xy);
-    ivec2 tileBase = p - localId;
-
-    // Cooperative load: 144 cells / 64 threads, strided so every thread pulls
-    // its share. Must run — and hit the barrier below — even for threads
-    // whose own p is out of image bounds (barrier() requires uniform control
-    // flow across the whole workgroup), hence the bounds check comes after.
-    int li = int(gl_LocalInvocationIndex);
-    for (int idx = li; idx < TILE * TILE; idx += 64) {
-        int ty = idx / TILE, tx = idx % TILE;
-        sharedLuma[ty][tx] = luma_padded(tileBase + ivec2(tx - HALO, ty - HALO), sz);
-    }
-    barrier();
-
     if (p.x >= sz.x || p.y >= sz.y) return;
+
+    // The 5x5 luma neighborhood is the same for all 64 output channels — read
+    // each of the 25 texels once here instead of once per (channel, tap), a
+    // 64x cut in texelFetch calls versus looping ky/kx inside the oc loop.
+    float luma[5][5];
+    for (int ky = 0; ky < 5; ky++)
+        for (int kx = 0; kx < 5; kx++)
+            luma[ky][kx] = luma_padded(p + ivec2(kx - 2, ky - 2), sz);
 
     for (int oc = 0; oc < 64; oc++) {
         float acc = w[B1_OFF + oc];
         for (int ky = 0; ky < 5; ky++) {
             for (int kx = 0; kx < 5; kx++) {
                 int widx = W1_OFF + oc * 25 + ky * 5 + kx;
-                acc += w[widx] * sharedLuma[localId.y + ky][localId.x + kx];
+                acc += w[widx] * luma[ky][kx];
             }
         }
         feat1[oc * sz.y * sz.x + p.y * sz.x + p.x] = tanh(acc);
