@@ -34,11 +34,6 @@
 // malformed/malicious response before it's used to size a memcpy.
 #define MAX_PLAINTEXT (MAX_OUT_W * MAX_OUT_H + 4)
 
-// zlib's own worst-case-expansion formula (see compressBound()'s doc) —
-// used as a compile-time constant since these are static array sizes, not
-// something we can call compressBound() for at this scope.
-#define ZLIB_BOUND(n) ((size_t)(n) + (size_t)(n) / 1000 + 12 + 5)
-
 static Thread g_thread;
 static Mutex g_lock;
 static bool g_run = false;      // background thread's run flag
@@ -135,8 +130,7 @@ static unsigned g_result_generation = 0;  // bumped every time a NEW result land
 // the thread started, before ever reaching the network (a real bug hit
 // while first testing this on hardware).
 static uint8_t s_send_copy[MAX_W * MAX_H];
-static uint8_t s_send_compressed[ZLIB_BOUND(MAX_W * MAX_H)];
-static uint8_t s_payload[8 + ZLIB_BOUND(MAX_W * MAX_H)];  // [w:u16][h:u16][ulen:u32][compressed]
+static uint8_t s_payload[4 + MAX_W * MAX_H];  // [w:u16][h:u16][raw luma] — uncompressed, see net_thread_func
 static uint8_t s_recv_buf[MAX_PLAINTEXT];  // holds the still-compressed response
 static uint8_t s_decompressed[MAX_PLAINTEXT];  // decompressed into here before use
 
@@ -349,20 +343,19 @@ static void net_thread_func(void *arg) {
 
             u64 t0 = armGetSystemTick();
 
-            // Compress before encrypting — the response (3x the request's
-            // pixel count) is bandwidth-bound over real WiFi, and there's
-            // compute headroom to spare (inference is ~9ms) for shrinking
-            // what's actually the dominant cost.
-            uLongf send_complen = sizeof(s_send_compressed);
-            if (compress2(s_send_compressed, &send_complen, s_send_copy, (uLong)sw * sh, 1) != Z_OK) break;
-
+            // Request goes uncompressed, unlike the response — compression
+            // cost is inherent to the algorithm's pattern-matching work, not
+            // just data size, and the Switch's CPU is the weakest link in
+            // this whole pipeline. The request (up to 57KB) is small enough
+            // that the bandwidth saved isn't worth spending cycles on the
+            // one device that can least afford them; the response (up to
+            // 516KB, compressed server-side on a much faster CPU) is where
+            // compression actually pays for itself.
             s_payload[0] = (uint8_t)(sw & 0xFF); s_payload[1] = (uint8_t)(sw >> 8);
             s_payload[2] = (uint8_t)(sh & 0xFF); s_payload[3] = (uint8_t)(sh >> 8);
-            uint32_t ulen = (uint32_t)sw * sh;
-            memcpy(s_payload + 4, &ulen, 4);
-            memcpy(s_payload + 8, s_send_compressed, send_complen);
+            memcpy(s_payload + 4, s_send_copy, (size_t)sw * sh);
 
-            if (!secure_send(sock, s_payload, 8 + send_complen)) break;
+            if (!secure_send(sock, s_payload, 4 + (size_t)sw * sh)) break;
 
             int n = secure_recv(sock, s_recv_buf, 500);  // 500ms: generous vs the
                                                         // ~7-20ms measured on a

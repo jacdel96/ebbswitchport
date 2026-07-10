@@ -203,18 +203,20 @@ def handle_client(sock, addr, psk_key, model, device):
     # (bench_realistic.py, bench_zlib.py) don't reproduce whatever the live
     # multi-threaded server process actually does — this measures the real
     # thing instead of guessing from a synthetic replica.
-    stage_times = {"decompress": [], "convert+xfer": [], "forward": [], "postprocess": [], "compress": [], "send": []}
+    stage_times = {"unpack": [], "convert+xfer": [], "forward": [], "postprocess": [], "compress": [], "send": []}
     try:
         while True:
             msg = channel.recv()
             t_recv_done = time.perf_counter()
 
-            w, h, ulen = struct.unpack("<HHI", msg[:8])
-            luma_bytes = zlib.decompress(msg[8:])
-            if len(luma_bytes) != ulen or len(luma_bytes) != w * h:
-                raise ValueError(f"expected {w*h} luma bytes, got {len(luma_bytes)} (ulen={ulen})")
-            luma = np.frombuffer(luma_bytes, dtype=np.uint8)
-            t_decompress_done = time.perf_counter()
+            # Request is sent uncompressed (see net_upscale.c) — small enough
+            # that the bandwidth saved isn't worth spending cycles on the
+            # Switch's much weaker CPU; only the response gets compressed.
+            w, h = struct.unpack("<HH", msg[:4])
+            if len(msg) - 4 != w * h:
+                raise ValueError(f"expected {w*h} luma bytes, got {len(msg)-4}")
+            luma = np.frombuffer(msg[4:], dtype=np.uint8)
+            t_decompress_done = time.perf_counter()  # no-op stage now, kept for the breakdown's shape
 
             x = torch.from_numpy(luma.reshape(1, 1, h, w).astype(np.float32) / 255.0)
             x = x.to(device)
@@ -245,7 +247,7 @@ def handle_client(sock, addr, psk_key, model, device):
             infer_times.append((t_infer_done - t_recv_done) * 1000)
             total_times.append((t_send_done - t_recv_done) * 1000)
             comp_ratios.append(len(comp) / len(out_bytes))
-            stage_times["decompress"].append((t_decompress_done - t_recv_done) * 1000)
+            stage_times["unpack"].append((t_decompress_done - t_recv_done) * 1000)
             stage_times["convert+xfer"].append((t_convert_done - t_decompress_done) * 1000)
             stage_times["forward"].append((t_infer_done - t_convert_done) * 1000)
             stage_times["postprocess"].append((t_postprocess_done - t_infer_done) * 1000)
