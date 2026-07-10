@@ -143,20 +143,32 @@ static int secure_recv(int sock, uint8_t *out, int timeout_ms) {
     if (frame_len < NONCE_LEN + TAG_LEN || frame_len > NONCE_LEN + MAX_PLAINTEXT + TAG_LEN)
         return -1;
 
-    size_t body_len = frame_len - NONCE_LEN;
-    uint8_t *body = malloc(body_len);
+    // frame_len covers the WHOLE [nonce][ciphertext][tag] payload — reading
+    // only frame_len - NONCE_LEN here (a bug this exact code had) leaves the
+    // wire nonce's bytes unread in the socket, desyncing every frame after
+    // the first: the very next read starts 12 bytes into what should've been
+    // the following message's length prefix.
+    uint8_t *body = malloc(frame_len);
     if (!body) return -1;
-    if (!recv_exact(sock, body, body_len, timeout_ms)) { free(body); return -1; }
+    if (!recv_exact(sock, body, frame_len, timeout_ms)) { free(body); return -1; }
 
-    unsigned char nonce[NONCE_LEN];
-    nonce_from_counter(g_recv_nonce_ctr, nonce);
-    size_t ct_len = body_len - TAG_LEN;
-    const unsigned char *ct = body;
-    const unsigned char *tag = body + ct_len;
+    const unsigned char *wire_nonce = body;
+    size_t ct_len = frame_len - NONCE_LEN - TAG_LEN;
+    const unsigned char *ct = body + NONCE_LEN;
+    const unsigned char *tag = body + NONCE_LEN + ct_len;
 
-    int rc = mbedtls_chachapoly_auth_decrypt(&g_aead, ct_len, nonce, NULL, 0, tag, ct, out);
+    // The nonce is authenticated as AEAD associated data implicitly (it's
+    // fed straight to auth_decrypt below), but also cross-check it against
+    // our own expected sequence counter first — catches a
+    // dropped/reordered/replayed message with a clear failure instead of
+    // silently trusting whatever sequence the wire claims.
+    unsigned char expected_nonce[NONCE_LEN];
+    nonce_from_counter(g_recv_nonce_ctr, expected_nonce);
+    if (memcmp(wire_nonce, expected_nonce, NONCE_LEN) != 0) { free(body); return -1; }
+
+    int rc = mbedtls_chachapoly_auth_decrypt(&g_aead, ct_len, wire_nonce, NULL, 0, tag, ct, out);
     free(body);
-    if (rc != 0) return -1;  // wrong nonce sequence or tampered/corrupt data
+    if (rc != 0) return -1;  // tampered/corrupt data
     g_recv_nonce_ctr++;
     return (int)ct_len;
 }
