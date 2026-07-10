@@ -35,6 +35,7 @@ import socket
 import struct
 import sys
 import threading
+import time
 
 import numpy as np
 import torch
@@ -191,9 +192,16 @@ def handle_client(sock, addr, psk_key, model, device):
     print(f"[+] {addr}: paired, session key established")
 
     frame_count = 0
+    STATS_WINDOW = 30  # print a summary every N frames rather than spamming per-frame
+    infer_times = []   # pure model forward time (recv already decrypted -> tensor ready)
+    total_times = []   # recv-decrypted to send-encrypted-and-flushed (server-side only —
+                        # does NOT include network transit either direction; that's
+                        # whatever gap the Switch itself measures around the whole round trip)
     try:
         while True:
             msg = channel.recv()
+            t_recv_done = time.perf_counter()
+
             w, h = struct.unpack("<HH", msg[:4])
             luma = np.frombuffer(msg[4:], dtype=np.uint8)
             if luma.size != w * h:
@@ -205,12 +213,26 @@ def handle_client(sock, addr, psk_key, model, device):
                 y = model(x)
                 if device.type == "mps":
                     torch.mps.synchronize()
+            t_infer_done = time.perf_counter()
+
             out = (y.clamp(0, 1) * 255.0).round().to(torch.uint8).cpu().numpy()
             out_h, out_w = out.shape[2], out.shape[3]
 
             reply = struct.pack("<HH", out_w, out_h) + out.tobytes()
             channel.send(reply)
+            t_send_done = time.perf_counter()
+
             frame_count += 1
+            infer_times.append((t_infer_done - t_recv_done) * 1000)
+            total_times.append((t_send_done - t_recv_done) * 1000)
+            if len(infer_times) >= STATS_WINDOW:
+                print(f"[t] {addr}: last {STATS_WINDOW} frames — "
+                      f"inference avg/min/max: {sum(infer_times)/len(infer_times):.2f}/"
+                      f"{min(infer_times):.2f}/{max(infer_times):.2f}ms, "
+                      f"server-side total avg/min/max: {sum(total_times)/len(total_times):.2f}/"
+                      f"{min(total_times):.2f}/{max(total_times):.2f}ms (excludes network transit)")
+                infer_times.clear()
+                total_times.clear()
     except ConnectionError:
         print(f"[-] {addr}: disconnected after {frame_count} frames")
     except Exception as e:
