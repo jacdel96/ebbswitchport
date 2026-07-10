@@ -41,20 +41,25 @@ void main() {
     ivec2 sz = ivec2(dims.size);
     if (p.x >= sz.x || p.y >= sz.y) return;
 
+    // Each (ic, ky, kx) feat2 value is shared by all 9 output channels — loop
+    // it on the outside and accumulate into all 9 channels per read, instead
+    // of re-reading it once per channel (9x fewer feat2 buffer reads).
     float outc[9];
-    for (int oc = 0; oc < 9; oc++) {
-        float acc = w[B3_OFF + oc];
-        for (int ic = 0; ic < 32; ic++) {
-            for (int ky = -1; ky <= 1; ky++) {
-                for (int kx = -1; kx <= 1; kx++) {
-                    float v = feat2_at(ic, p + ivec2(kx, ky), sz);
-                    int widx = W3_OFF + oc * 32 * 9 + ic * 9 + (ky + 1) * 3 + (kx + 1);
-                    acc += w[widx] * v;
+    for (int oc = 0; oc < 9; oc++) outc[oc] = w[B3_OFF + oc];
+
+    for (int ic = 0; ic < 32; ic++) {
+        for (int ky = -1; ky <= 1; ky++) {
+            for (int kx = -1; kx <= 1; kx++) {
+                float v = feat2_at(ic, p + ivec2(kx, ky), sz);
+                int kidx = (ky + 1) * 3 + (kx + 1);
+                for (int oc = 0; oc < 9; oc++) {
+                    int widx = W3_OFF + oc * 32 * 9 + ic * 9 + kidx;
+                    outc[oc] += w[widx] * v;
                 }
             }
         }
-        outc[oc] = acc;  // no activation on the final layer
     }
+    // no activation on the final layer
 
     vec3 srcColor = texelFetch(srcImage, p, 0).rgb;
     float cb = -0.168736 * srcColor.r - 0.331264 * srcColor.g + 0.5 * srcColor.b + 0.5;

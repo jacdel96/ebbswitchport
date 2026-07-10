@@ -30,13 +30,20 @@ void main() {
     ivec2 sz = ivec2(dims.size);
     if (p.x >= sz.x || p.y >= sz.y) return;
 
+    // The 5x5 luma neighborhood is the same for all 64 output channels — read
+    // each of the 25 texels once here instead of once per (channel, tap), a
+    // 64x cut in texelFetch calls versus looping ky/kx inside the oc loop.
+    float luma[5][5];
+    for (int ky = 0; ky < 5; ky++)
+        for (int kx = 0; kx < 5; kx++)
+            luma[ky][kx] = luma_padded(p + ivec2(kx - 2, ky - 2), sz);
+
     for (int oc = 0; oc < 64; oc++) {
         float acc = w[B1_OFF + oc];
-        for (int ky = -2; ky <= 2; ky++) {
-            for (int kx = -2; kx <= 2; kx++) {
-                float v = luma_padded(p + ivec2(kx, ky), sz);
-                int widx = W1_OFF + oc * 25 + (ky + 2) * 5 + (kx + 2);
-                acc += w[widx] * v;
+        for (int ky = 0; ky < 5; ky++) {
+            for (int kx = 0; kx < 5; kx++) {
+                int widx = W1_OFF + oc * 25 + ky * 5 + kx;
+                acc += w[widx] * luma[ky][kx];
             }
         }
         feat1[oc * sz.y * sz.x + p.y * sz.x + p.x] = tanh(acc);

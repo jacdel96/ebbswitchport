@@ -22,17 +22,24 @@ void main() {
     ivec2 sz = ivec2(dims.size);
     if (p.x >= sz.x || p.y >= sz.y) return;
 
-    for (int oc = 0; oc < 32; oc++) {
-        float acc = w[B2_OFF + oc];
-        for (int ic = 0; ic < 64; ic++) {
-            for (int ky = -1; ky <= 1; ky++) {
-                for (int kx = -1; kx <= 1; kx++) {
-                    float v = feat1_at(ic, p + ivec2(kx, ky), sz);
-                    int widx = W2_OFF + oc * 64 * 9 + ic * 9 + (ky + 1) * 3 + (kx + 1);
-                    acc += w[widx] * v;
+    // Each (ic, ky, kx) feat1 value is shared by all 32 output channels — loop
+    // it on the outside and accumulate into all 32 channels per read, instead
+    // of re-reading it once per channel (32x fewer feat1 buffer reads).
+    float acc[32];
+    for (int oc = 0; oc < 32; oc++) acc[oc] = w[B2_OFF + oc];
+
+    for (int ic = 0; ic < 64; ic++) {
+        for (int ky = -1; ky <= 1; ky++) {
+            for (int kx = -1; kx <= 1; kx++) {
+                float v = feat1_at(ic, p + ivec2(kx, ky), sz);
+                int kidx = (ky + 1) * 3 + (kx + 1);
+                for (int oc = 0; oc < 32; oc++) {
+                    int widx = W2_OFF + oc * 64 * 9 + ic * 9 + kidx;
+                    acc[oc] += w[widx] * v;
                 }
             }
         }
-        feat2[oc * sz.y * sz.x + p.y * sz.x + p.x] = tanh(acc);
     }
+    for (int oc = 0; oc < 32; oc++)
+        feat2[oc * sz.y * sz.x + p.y * sz.x + p.x] = tanh(acc[oc]);
 }

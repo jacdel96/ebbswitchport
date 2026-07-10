@@ -141,6 +141,10 @@ static DkMemBlock g_espcnFeat2Mem;      // SSBO: 32 x ESPCN_MAX_H x ESPCN_MAX_W 
 static DkMemBlock g_espcnOutImgMem;
 static DkImage g_espcnOutImage;         // (ESPCN_MAX_W*3) x (ESPCN_MAX_H*3), load/store + sampled
 static unsigned g_espcn_last_us = 0;    // wall-clock time of the last dispatch, for the HUD
+static bool g_espcn_have_output = false; // g_espcnOutImage holds a valid result for the
+                                          // current g_gameImage contents — see gpu_video_present's
+                                          // dupe-frame skip (this is what makes reusing it correct
+                                          // rather than stale garbage on the very first run).
 
 static DkMemBlock g_cmdbufMemBlock;
 static DkCmdBuf g_cmdbuf;
@@ -289,6 +293,7 @@ bool gpu_video_init(NWindow *win) {
     g_espcn_enabled = false;
     g_espcnWeights = g_espcnDimsUbo = g_espcnFeat1Mem = g_espcnFeat2Mem = g_espcnOutImgMem = NULL;
     g_espcn_last_us = 0;
+    g_espcn_have_output = false;
     g_win = win;
     resolution_for_mode(&g_fb_w, &g_fb_h);  // start at whatever mode we're already in
     compute_dst_layout();
@@ -579,6 +584,10 @@ static void resize_swapchain(unsigned new_w, unsigned new_h) {
 
 void gpu_video_set_ai_upscale(bool enabled) {
     if (!g_ready) return;
+    if (enabled && !g_espcn_enabled) g_espcn_have_output = false;  // force a fresh
+                                      // dispatch on the next present rather than
+                                      // reusing whatever (possibly long-stale, or
+                                      // never-written) output was last there.
     g_espcn_enabled = enabled;
 }
 
@@ -677,7 +686,15 @@ void gpu_video_present(void) {
     if (want_w != g_fb_w || want_h != g_fb_h) resize_swapchain(want_w, want_h);
 
     bool use_espcn = gpu_video_ai_upscale_active();
-    if (use_espcn) run_espcn_upscale();
+    // Skip the recompute on ticks with no new game frame (the SNES core
+    // frequently re-presents the same frame while pacing to audio — see
+    // main.c's dupe-frame tracking). g_espcnOutImage still holds last time's
+    // result, which is exactly correct to reuse since the source pixels
+    // (g_gameImage) haven't changed either.
+    if (use_espcn && (g_game_pending || !g_espcn_have_output)) {
+        run_espcn_upscale();
+        g_espcn_have_output = true;
+    }
 
     int slot = dkQueueAcquireImage(g_queue, g_swapchain);
 
