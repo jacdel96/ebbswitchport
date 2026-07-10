@@ -487,8 +487,14 @@ static void settings_adjust(int sel, int dir) {
         g_settings.crt_mode = !g_settings.crt_mode;        // live (GPU path only)
         gpu_video_set_crt(g_settings.crt_mode);
     } else if (sel == 7) {
-        g_settings.ai_upscale = !g_settings.ai_upscale;    // live (GPU path only; no-op if weights absent)
-        gpu_video_set_ai_upscale(g_settings.ai_upscale);
+        // Refuse to flip on when it can't actually run — see the Settings
+        // row's "N/A" text for why. Avoids a setting that reads "On" while
+        // silently doing nothing (or, worse, reading "On" from a save file
+        // on a build/device where it never had a chance to become available).
+        if (g_use_gpu && gpu_video_ai_upscale_available()) {
+            g_settings.ai_upscale = !g_settings.ai_upscale;
+            gpu_video_set_ai_upscale(g_settings.ai_upscale);
+        }
     }
     settings_save(&g_settings);
 }
@@ -534,6 +540,10 @@ static void draw_menu(u32 *fb, u32 stride) {
                                        g_settings.overclock_boost_frames);
             else if (i == 6) snprintf(line, sizeof(line), "%-16s %s", "CRT Mode",
                                        g_settings.crt_mode ? "On" : "Off");
+            else if (!g_use_gpu) snprintf(line, sizeof(line), "%-16s %s", "AI Upscale",
+                                            "N/A (needs GPU accel)");
+            else if (!gpu_video_ai_upscale_available()) snprintf(line, sizeof(line), "%-16s %s",
+                                            "AI Upscale", "N/A (no weights)");
             else snprintf(line, sizeof(line), "%-16s %s", "AI Upscale",
                           g_settings.ai_upscale ? "On" : "Off");
         } else {

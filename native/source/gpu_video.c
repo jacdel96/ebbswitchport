@@ -304,6 +304,14 @@ bool gpu_video_init(NWindow *win) {
     // includes it, but the original (pre-ESPCN) code here overwrote flags
     // with Graphics only, silently dropping it.
     qMaker.flags = DkQueueFlags_Graphics | DkQueueFlags_Compute;
+    // The default perWarpScratchMemorySize (4 * DK_PER_WARP_SCRATCH_MEM_ALIGNMENT
+    // = 2KB) is sized for this file's tiny vertex/fragment shaders. The ESPCN
+    // compute shaders unroll deep nested loops (64ch/32ch convolutions), which
+    // need far more per-warp scratch register space — too little of it is
+    // exactly "not enough scratch memory to run compute shaders" from the
+    // debug validation layer, a fatal dkQueueSubmitCommands abort on real
+    // hardware. 16x headroom over the default.
+    qMaker.perWarpScratchMemorySize = 16 * DK_PER_WARP_SCRATCH_MEM_ALIGNMENT;
     g_queue = dkQueueCreate(&qMaker);
     if (!g_queue) { teardown(); return false; }
 
@@ -581,6 +589,10 @@ bool gpu_video_ai_upscale_active(void) {
 
 unsigned gpu_video_get_ai_upscale_us(void) {
     return g_espcn_last_us;
+}
+
+bool gpu_video_ai_upscale_available(void) {
+    return g_espcn_available;
 }
 
 // Runs the 3 ESPCN compute passes (espcn1/2/3_comp.glsl) against the current

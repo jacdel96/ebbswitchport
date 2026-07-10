@@ -57,6 +57,12 @@ void gpu_video_set_ai_upscale(bool enabled);
 bool gpu_video_ai_upscale_active(void);
 unsigned gpu_video_get_ai_upscale_us(void);  // last dispatch's wall-clock cost, 0 if it didn't run
 
+// True if the weights file loaded and every ESPCN resource allocated OK at
+// init — i.e. whether the feature CAN run at all, independent of the user's
+// on/off setting. The Settings menu uses this to show why the toggle is
+// inert instead of silently doing nothing.
+bool gpu_video_ai_upscale_available(void);
+
 // Uploads whatever changed since the last call, draws, and presents. Call once
 // per main-loop iteration, whether or not a new game frame arrived that tick
 // (mirrors the CPU path's present(), which redraws the last frame every tick).
