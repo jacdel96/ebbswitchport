@@ -199,6 +199,27 @@ static void ai_timing_tick(unsigned us) {
     g_ai_us_window_max = 0;
 }
 
+// Same windowing again, for the experimental network AI-upscale offload
+// (see net_upscale.h) — only ticked on frames where a new result actually
+// arrived, mirroring ai_timing_tick's reasoning.
+static unsigned long long g_net_us_sum = 0;
+static unsigned g_net_us_count = 0;
+static unsigned g_net_us_window_max = 0;
+static unsigned g_net_avg_us = 0;
+static unsigned g_net_max_us = 0;
+
+static void net_timing_tick(unsigned us) {
+    g_net_us_sum += us;
+    g_net_us_count++;
+    if (us > g_net_us_window_max) g_net_us_window_max = us;
+    if (g_net_us_count < 30) return;
+    g_net_avg_us = (unsigned)(g_net_us_sum / g_net_us_count);
+    g_net_max_us = g_net_us_window_max;
+    g_net_us_sum = 0;
+    g_net_us_count = 0;
+    g_net_us_window_max = 0;
+}
+
 // --- rendering backend selection ---------------------------------------------
 // GPU (deko3d) path state — populated only when g_use_gpu is true.
 static bool g_use_gpu = false;
@@ -213,6 +234,8 @@ static PixelLut g_pixlut = {0};         // shared 16bpp->RGBA8 LUT (CPU and GPU 
 static bool g_net_initialized = false;  // net_upscale_init has been called this session
 static uint8_t *g_luma_buf = NULL;      // scratch: luma extracted from g_native_frame
 static unsigned g_luma_cap = 0;
+static unsigned g_net_last_generation = 0;  // last net_upscale_get_result_generation()
+                                             // we ticked timing for — see net_timing_tick
 
 // --- libretro callbacks ------------------------------------------------------
 static void video_refresh(const void *data, unsigned width, unsigned height,
@@ -701,6 +724,7 @@ static void draw_hud(u32 *fb, u32 stride, u32 canvas_h, int x0, int y0) {
     audio_stats(&as);
     char line1[80], line2[48], line3[48];
     bool ai_active = g_use_gpu && gpu_video_ai_upscale_active();
+    bool net_active = g_use_gpu && g_settings.net_upscale && g_net_initialized;
     // g_use_gpu reflects the backend actually running this session (settings
     // hw_accel is only the *request* — gpu_video_init may have failed and
     // silently fallen back to CPU, see main()'s init), not just the setting.
@@ -719,24 +743,31 @@ static void draw_hud(u32 *fb, u32 stride, u32 canvas_h, int x0, int y0) {
              avg_x10 / 10, avg_x10 % 10, max_x10 / 10, max_x10 % 10);
     // Experimental AI (ESPCN) upscale timing — only shown while it's actually
     // running (GPU path, weights present, enabled, resolution in range).
+    // Mutually exclusive with the network path (see settings_adjust), so at
+    // most one of these two ever applies.
     if (ai_active) {
         unsigned ai_avg_x10 = g_ai_avg_us / 100, ai_max_x10 = g_ai_max_us / 100;
         snprintf(line3, sizeof(line3), "AI avg %u.%ums  max %u.%ums",
                  ai_avg_x10 / 10, ai_avg_x10 % 10, ai_max_x10 / 10, ai_max_x10 % 10);
+    } else if (net_active) {
+        unsigned net_avg_x10 = g_net_avg_us / 100, net_max_x10 = g_net_max_us / 100;
+        snprintf(line3, sizeof(line3), "NET avg %u.%ums  max %u.%ums",
+                 net_avg_x10 / 10, net_avg_x10 % 10, net_max_x10 / 10, net_max_x10 % 10);
     }
 
+    bool line3_active = ai_active || net_active;
     const int scale = 2;
     int lh = 8 * scale + 6;
     int w1 = osd_text_w(line1, scale), w2 = osd_text_w(line2, scale);
-    int w3 = ai_active ? osd_text_w(line3, scale) : 0;
+    int w3 = line3_active ? osd_text_w(line3, scale) : 0;
     int wmax = w1 > w2 ? w1 : w2;
     if (w3 > wmax) wmax = w3;
-    int lines = ai_active ? 3 : 2;
+    int lines = line3_active ? 3 : 2;
     int w = wmax + 24, h = lh * lines + 12;
     osd_rect(fb, stride, canvas_h, x0, y0, w, h, 0xFF181818u);
     osd_text(fb, stride, canvas_h, x0 + 12, y0 + 6, 0xFFFFFFFFu, scale, line1);
     osd_text(fb, stride, canvas_h, x0 + 12, y0 + 6 + lh, 0xFFFFFFFFu, scale, line2);
-    if (ai_active) osd_text(fb, stride, canvas_h, x0 + 12, y0 + 6 + lh * 2, 0xFFFFFFFFu, scale, line3);
+    if (line3_active) osd_text(fb, stride, canvas_h, x0 + 12, y0 + 6 + lh * 2, 0xFFFFFFFFu, scale, line3);
 }
 
 // GPU-path only: builds the paused-menu backdrop (native-res frame nearest-
@@ -776,8 +807,14 @@ static void present(void) {
         if (g_settings.net_upscale && g_net_initialized) {
             const uint8_t *result_luma;
             unsigned rw, rh;
-            if (net_upscale_get_result(&result_luma, &rw, &rh))
+            if (net_upscale_get_result(&result_luma, &rw, &rh)) {
                 gpu_video_upload_network_result(result_luma, rw, rh);
+                unsigned gen = net_upscale_get_result_generation();
+                if (gen != g_net_last_generation) {
+                    g_net_last_generation = gen;
+                    net_timing_tick(net_upscale_get_last_rtt_us());
+                }
+            }
         }
         bool ai_ran = gpu_video_ai_upscale_active();
         gpu_video_present();

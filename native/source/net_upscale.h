@@ -47,6 +47,19 @@ bool net_upscale_get_result(const uint8_t **out_luma, unsigned *out_w, unsigned 
 // True once the pairing handshake has succeeded and the connection is live.
 bool net_upscale_connected(void);
 
+// Wall-clock time (microseconds) of the last full send+recv round trip
+// (compress+encrypt+send, then recv+decrypt+decompress) — the HUD's
+// equivalent of gpu_video_get_ai_upscale_us() for the local GPU path.
+// 0 if no round trip has completed yet.
+unsigned net_upscale_get_last_rtt_us(void);
+
+// Increments once per new result landed. net_upscale_get_result() re-returns
+// the same latched result on every poll, so callers that need to distinguish
+// "a genuinely new round trip just completed" from "still showing the same
+// one as last poll" (e.g. HUD timing averages) should only act when this
+// value has changed since their last observation.
+unsigned net_upscale_get_result_generation(void);
+
 // Stops the background thread and closes the socket. Safe to call even if
 // net_upscale_init was never called, or failed.
 void net_upscale_exit(void);

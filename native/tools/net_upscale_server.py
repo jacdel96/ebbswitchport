@@ -36,6 +36,7 @@ import struct
 import sys
 import threading
 import time
+import zlib
 
 import numpy as np
 import torch
@@ -197,15 +198,17 @@ def handle_client(sock, addr, psk_key, model, device):
     total_times = []   # recv-decrypted to send-encrypted-and-flushed (server-side only —
                         # does NOT include network transit either direction; that's
                         # whatever gap the Switch itself measures around the whole round trip)
+    comp_ratios = []   # compressed / original size of each response, for visibility
     try:
         while True:
             msg = channel.recv()
             t_recv_done = time.perf_counter()
 
-            w, h = struct.unpack("<HH", msg[:4])
-            luma = np.frombuffer(msg[4:], dtype=np.uint8)
-            if luma.size != w * h:
-                raise ValueError(f"expected {w*h} luma bytes, got {luma.size}")
+            w, h, ulen = struct.unpack("<HHI", msg[:8])
+            luma_bytes = zlib.decompress(msg[8:])
+            if len(luma_bytes) != ulen or len(luma_bytes) != w * h:
+                raise ValueError(f"expected {w*h} luma bytes, got {len(luma_bytes)} (ulen={ulen})")
+            luma = np.frombuffer(luma_bytes, dtype=np.uint8)
 
             x = torch.from_numpy(luma.reshape(1, 1, h, w).astype(np.float32) / 255.0)
             x = x.to(device)
@@ -217,22 +220,30 @@ def handle_client(sock, addr, psk_key, model, device):
 
             out = (y.clamp(0, 1) * 255.0).round().to(torch.uint8).cpu().numpy()
             out_h, out_w = out.shape[2], out.shape[3]
+            out_bytes = out.tobytes()
+            # level 1: fastest setting — we have compute headroom (inference
+            # is ~9ms) to spend a few ms shrinking what's actually the
+            # dominant cost, the WiFi transfer of this response.
+            comp = zlib.compress(out_bytes, level=1)
 
-            reply = struct.pack("<HH", out_w, out_h) + out.tobytes()
+            reply = struct.pack("<HHI", out_w, out_h, len(out_bytes)) + comp
             channel.send(reply)
             t_send_done = time.perf_counter()
 
             frame_count += 1
             infer_times.append((t_infer_done - t_recv_done) * 1000)
             total_times.append((t_send_done - t_recv_done) * 1000)
+            comp_ratios.append(len(comp) / len(out_bytes))
             if len(infer_times) >= STATS_WINDOW:
                 print(f"[t] {addr}: last {STATS_WINDOW} frames — "
                       f"inference avg/min/max: {sum(infer_times)/len(infer_times):.2f}/"
                       f"{min(infer_times):.2f}/{max(infer_times):.2f}ms, "
                       f"server-side total avg/min/max: {sum(total_times)/len(total_times):.2f}/"
-                      f"{min(total_times):.2f}/{max(total_times):.2f}ms (excludes network transit)")
+                      f"{min(total_times):.2f}/{max(total_times):.2f}ms (excludes network transit), "
+                      f"response compressed to {sum(comp_ratios)/len(comp_ratios)*100:.0f}% of original size avg")
                 infer_times.clear()
                 total_times.clear()
+                comp_ratios.clear()
     except ConnectionError:
         print(f"[-] {addr}: disconnected after {frame_count} frames")
     except Exception as e:

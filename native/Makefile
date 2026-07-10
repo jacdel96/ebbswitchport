@@ -57,9 +57,9 @@ DEKO3D_DEBUG ?= 1
 # for the experimental network AI-upscale offload (net_upscale.c). Link order
 # matters: mbedtls depends on mbedx509, which depends on mbedcrypto.
 ifeq ($(DEKO3D_DEBUG),1)
-LIBS := -ldeko3dd -lsnes9x_libretro_libnx -lmbedtls -lmbedx509 -lmbedcrypto -lstdc++ -lnx -lm
+LIBS := -ldeko3dd -lsnes9x_libretro_libnx -lmbedtls -lmbedx509 -lmbedcrypto -lz -lstdc++ -lnx -lm
 else
-LIBS := -ldeko3d -lsnes9x_libretro_libnx -lmbedtls -lmbedx509 -lmbedcrypto -lstdc++ -lnx -lm
+LIBS := -ldeko3d -lsnes9x_libretro_libnx -lmbedtls -lmbedx509 -lmbedcrypto -lz -lstdc++ -lnx -lm
 endif
 
 # lib search: native/lib (core) + libnx.

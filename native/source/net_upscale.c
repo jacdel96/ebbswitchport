@@ -17,6 +17,7 @@
 #include <mbedtls/chachapoly.h>
 #include <mbedtls/hkdf.h>
 #include <mbedtls/md.h>
+#include <zlib.h>
 
 #define CHALLENGE_LEN 16
 #define HMAC_LEN 32
@@ -33,11 +34,18 @@
 // malformed/malicious response before it's used to size a memcpy.
 #define MAX_PLAINTEXT (MAX_OUT_W * MAX_OUT_H + 4)
 
+// zlib's own worst-case-expansion formula (see compressBound()'s doc) —
+// used as a compile-time constant since these are static array sizes, not
+// something we can call compressBound() for at this scope.
+#define ZLIB_BOUND(n) ((size_t)(n) + (size_t)(n) / 1000 + 12 + 5)
+
 static Thread g_thread;
 static Mutex g_lock;
 static bool g_run = false;      // background thread's run flag
 static bool g_ready = false;    // net_upscale_init succeeded, thread is alive
 static bool g_connected = false; // handshake completed, frames flowing
+static unsigned g_last_rtt_us = 0; // wall-clock time of the last full
+                                    // send+recv round trip, for the HUD
 
 static char g_host[MAX_HOST_LEN];
 static uint16_t g_port;
@@ -54,6 +62,11 @@ static bool g_send_pending = false;
 static uint8_t g_result_luma[MAX_OUT_W * MAX_OUT_H];
 static unsigned g_result_w = 0, g_result_h = 0;
 static bool g_have_result = false;
+static unsigned g_result_generation = 0;  // bumped every time a NEW result lands —
+                                           // net_upscale_get_result() re-returns the
+                                           // same latched result on every poll, so
+                                           // callers that need "is this actually new"
+                                           // (e.g. HUD timing) compare this counter.
 
 // net_thread_func's own scratch — MUST be static, not stack locals: this
 // thread's stack (see threadCreate below) is a few KB, and these are up to
@@ -61,8 +74,10 @@ static bool g_have_result = false;
 // the thread started, before ever reaching the network (a real bug hit
 // while first testing this on hardware).
 static uint8_t s_send_copy[MAX_W * MAX_H];
-static uint8_t s_payload[4 + MAX_W * MAX_H];
-static uint8_t s_recv_buf[MAX_PLAINTEXT];
+static uint8_t s_send_compressed[ZLIB_BOUND(MAX_W * MAX_H)];
+static uint8_t s_payload[8 + ZLIB_BOUND(MAX_W * MAX_H)];  // [w:u16][h:u16][ulen:u32][compressed]
+static uint8_t s_recv_buf[MAX_PLAINTEXT];  // holds the still-compressed response
+static uint8_t s_decompressed[MAX_PLAINTEXT];  // decompressed into here before use
 
 static uint64_t g_send_nonce_ctr;
 static uint64_t g_recv_nonce_ctr;
@@ -270,25 +285,44 @@ static void net_thread_func(void *arg) {
 
             if (!have_send) { svcSleepThread(1000000ULL); continue; }  // 1ms idle poll
 
+            u64 t0 = armGetSystemTick();
+
+            // Compress before encrypting — the response (3x the request's
+            // pixel count) is bandwidth-bound over real WiFi, and there's
+            // compute headroom to spare (inference is ~9ms) for shrinking
+            // what's actually the dominant cost.
+            uLongf send_complen = sizeof(s_send_compressed);
+            if (compress2(s_send_compressed, &send_complen, s_send_copy, (uLong)sw * sh, 1) != Z_OK) break;
+
             s_payload[0] = (uint8_t)(sw & 0xFF); s_payload[1] = (uint8_t)(sw >> 8);
             s_payload[2] = (uint8_t)(sh & 0xFF); s_payload[3] = (uint8_t)(sh >> 8);
-            memcpy(s_payload + 4, s_send_copy, (size_t)sw * sh);
+            uint32_t ulen = (uint32_t)sw * sh;
+            memcpy(s_payload + 4, &ulen, 4);
+            memcpy(s_payload + 8, s_send_compressed, send_complen);
 
-            if (!secure_send(sock, s_payload, 4 + (size_t)sw * sh)) break;
+            if (!secure_send(sock, s_payload, 8 + send_complen)) break;
 
             int n = secure_recv(sock, s_recv_buf, 500);  // 500ms: generous vs the
                                                         // ~7-20ms measured on a
                                                         // real laptop+LAN, still
                                                         // far under a stalled frame
-            if (n < 4) break;
+            if (n < 8) break;
             unsigned ow = s_recv_buf[0] | (s_recv_buf[1] << 8);
             unsigned oh = s_recv_buf[2] | (s_recv_buf[3] << 8);
-            if (ow > MAX_OUT_W || oh > MAX_OUT_H || (size_t)(n - 4) != (size_t)ow * oh) break;
+            uint32_t recv_ulen; memcpy(&recv_ulen, s_recv_buf + 4, 4);
+            if (ow > MAX_OUT_W || oh > MAX_OUT_H || recv_ulen != (uint32_t)ow * oh) break;
+
+            uLongf out_len = sizeof(s_decompressed);
+            if (uncompress(s_decompressed, &out_len, s_recv_buf + 8, (uLong)(n - 8)) != Z_OK) break;
+            if (out_len != recv_ulen) break;
+
+            g_last_rtt_us = (unsigned)(armTicksToNs(armGetSystemTick() - t0) / 1000);
 
             mutexLock(&g_lock);
-            memcpy(g_result_luma, s_recv_buf + 4, (size_t)ow * oh);
+            memcpy(g_result_luma, s_decompressed, (size_t)ow * oh);
             g_result_w = ow; g_result_h = oh;
             g_have_result = true;
+            g_result_generation++;
             mutexUnlock(&g_lock);
         }
 
@@ -363,6 +397,14 @@ bool net_upscale_connected(void) {
     bool c = g_connected;
     mutexUnlock(&g_lock);
     return c;
+}
+
+unsigned net_upscale_get_last_rtt_us(void) {
+    return g_last_rtt_us;
+}
+
+unsigned net_upscale_get_result_generation(void) {
+    return g_result_generation;
 }
 
 void net_upscale_exit(void) {
