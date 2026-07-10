@@ -54,6 +54,15 @@ static uint8_t g_result_luma[MAX_OUT_W * MAX_OUT_H];
 static unsigned g_result_w = 0, g_result_h = 0;
 static bool g_have_result = false;
 
+// net_thread_func's own scratch — MUST be static, not stack locals: this
+// thread's stack (see threadCreate below) is a few KB, and these are up to
+// ~2.4MB. A prior version had these as stack arrays and crashed the instant
+// the thread started, before ever reaching the network (a real bug hit
+// while first testing this on hardware).
+static uint8_t s_send_copy[MAX_W * MAX_H];
+static uint8_t s_payload[4 + MAX_W * MAX_H];
+static uint8_t s_recv_buf[MAX_PLAINTEXT];
+
 static uint64_t g_send_nonce_ctr;
 static uint64_t g_recv_nonce_ctr;
 static mbedtls_chachapoly_context g_aead;
@@ -230,36 +239,33 @@ static void net_thread_func(void *arg) {
         g_connected = true;
         mutexUnlock(&g_lock);
 
-        uint8_t recv_buf[MAX_PLAINTEXT];
         while (g_run) {
             mutexLock(&g_lock);
             bool have_send = g_send_pending;
             unsigned sw = g_send_w, sh = g_send_h;
-            uint8_t send_copy[MAX_W * MAX_H];
-            if (have_send) memcpy(send_copy, g_send_luma, (size_t)sw * sh);
+            if (have_send) memcpy(s_send_copy, g_send_luma, (size_t)sw * sh);
             g_send_pending = false;
             mutexUnlock(&g_lock);
 
             if (!have_send) { svcSleepThread(1000000ULL); continue; }  // 1ms idle poll
 
-            uint8_t payload[4 + MAX_W * MAX_H];
-            payload[0] = (uint8_t)(sw & 0xFF); payload[1] = (uint8_t)(sw >> 8);
-            payload[2] = (uint8_t)(sh & 0xFF); payload[3] = (uint8_t)(sh >> 8);
-            memcpy(payload + 4, send_copy, (size_t)sw * sh);
+            s_payload[0] = (uint8_t)(sw & 0xFF); s_payload[1] = (uint8_t)(sw >> 8);
+            s_payload[2] = (uint8_t)(sh & 0xFF); s_payload[3] = (uint8_t)(sh >> 8);
+            memcpy(s_payload + 4, s_send_copy, (size_t)sw * sh);
 
-            if (!secure_send(sock, payload, 4 + (size_t)sw * sh)) break;
+            if (!secure_send(sock, s_payload, 4 + (size_t)sw * sh)) break;
 
-            int n = secure_recv(sock, recv_buf, 500);  // 500ms: generous vs the
+            int n = secure_recv(sock, s_recv_buf, 500);  // 500ms: generous vs the
                                                         // ~7-20ms measured on a
                                                         // real laptop+LAN, still
                                                         // far under a stalled frame
             if (n < 4) break;
-            unsigned ow = recv_buf[0] | (recv_buf[1] << 8);
-            unsigned oh = recv_buf[2] | (recv_buf[3] << 8);
+            unsigned ow = s_recv_buf[0] | (s_recv_buf[1] << 8);
+            unsigned oh = s_recv_buf[2] | (s_recv_buf[3] << 8);
             if (ow > MAX_OUT_W || oh > MAX_OUT_H || (size_t)(n - 4) != (size_t)ow * oh) break;
 
             mutexLock(&g_lock);
-            memcpy(g_result_luma, recv_buf + 4, (size_t)ow * oh);
+            memcpy(g_result_luma, s_recv_buf + 4, (size_t)ow * oh);
             g_result_w = ow; g_result_h = oh;
             g_have_result = true;
             mutexUnlock(&g_lock);
@@ -298,7 +304,7 @@ bool net_upscale_init(const char *host_port, const char *pairing_code) {
     g_aead_keyed = false;
     g_run = true;
 
-    if (R_FAILED(threadCreate(&g_thread, net_thread_func, NULL, NULL, 0x4000, 0x2C, 1)) ||
+    if (R_FAILED(threadCreate(&g_thread, net_thread_func, NULL, NULL, 0x8000, 0x2C, 1)) ||
         R_FAILED(threadStart(&g_thread))) {
         g_run = false;
         socketExit();
