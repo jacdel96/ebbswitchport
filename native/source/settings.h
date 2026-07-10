@@ -13,6 +13,8 @@ typedef struct {
                                  // drops (see main.c's overclock_tick); live, no restart
     unsigned overclock_trigger_dupes; // consecutive dupes that arm a boost
     unsigned overclock_boost_frames;  // how long a boost lasts once (re)armed
+    bool     crt_mode;         // scanlines/phosphor mask/vignette on the game
+                                // quad; GPU-path only (no-op on CPU path), live
 } Settings;
 
 // Fills *out with defaults, then overrides from sdmc:/switch/ebbswitchport/settings.cfg

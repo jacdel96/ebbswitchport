@@ -53,8 +53,8 @@ static u32 *g_frame = NULL;
 #define SLOT_COUNT 10            // manual slots 0..9
 #define LOAD_COUNT (SLOT_COUNT + 2)  // + auto1 + auto10
 #define MAIN_COUNT 6             // Resume/Save/Load/Reset/Settings/Exit
-#define SETTINGS_COUNT 6         // Hardware Accel/Audio Buffer/Show HUD/Dynamic Overclock/
-                                  // OC Trigger/OC Boost
+#define SETTINGS_COUNT 7         // Hardware Accel/Audio Buffer/Show HUD/Dynamic Overclock/
+                                  // OC Trigger/OC Boost/CRT Mode
 static bool g_menu_open = false;
 static int g_menu_level = 0;
 static int g_menu_sel = 0;
@@ -148,6 +148,31 @@ static void fps_tick(void) {
     if (g_frame_total > 0) g_lag_pct = g_dupe_count * 100 / g_frame_total;
     g_dupe_count = 0;
     g_frame_total = 0;
+}
+
+// Direct measurement of how long retro_run() itself takes, independent of the
+// dupe-frame signal above (which some cores, possibly including this one,
+// never actually use — a 0% lag reading doesn't rule out real per-frame cost,
+// it may just mean the core always hands back fresh pixels regardless of how
+// long it took). A call exceeding ~16.7ms is by itself missing the 60fps
+// frame budget, dupes or not.
+static unsigned long long g_run_us_sum = 0;
+static unsigned g_run_us_count = 0;
+static unsigned g_run_us_window_max = 0;
+static unsigned g_run_avg_us = 0;   // last computed window average, shown in the HUD
+static unsigned g_run_max_us = 0;   // last computed window max, shown in the HUD
+
+// Call once per retro_run(), with how long that call took in microseconds.
+static void run_timing_tick(unsigned us) {
+    g_run_us_sum += us;
+    g_run_us_count++;
+    if (us > g_run_us_window_max) g_run_us_window_max = us;
+    if (g_run_us_count < 30) return;
+    g_run_avg_us = (unsigned)(g_run_us_sum / g_run_us_count);
+    g_run_max_us = g_run_us_window_max;
+    g_run_us_sum = 0;
+    g_run_us_count = 0;
+    g_run_us_window_max = 0;
 }
 
 // --- rendering backend selection ---------------------------------------------
@@ -436,6 +461,9 @@ static void settings_adjust(int sel, int dir) {
         if (v < OVERCLOCK_BOOST_MIN) v = OVERCLOCK_BOOST_MIN;
         if (v > OVERCLOCK_BOOST_MAX) v = OVERCLOCK_BOOST_MAX;
         g_settings.overclock_boost_frames = (unsigned)v;   // live, read fresh by overclock_tick
+    } else if (sel == 6) {
+        g_settings.crt_mode = !g_settings.crt_mode;        // live (GPU path only)
+        gpu_video_set_crt(g_settings.crt_mode);
     }
     settings_save(&g_settings);
 }
@@ -477,8 +505,10 @@ static void draw_menu(u32 *fb, u32 stride) {
                                        g_settings.dynamic_overclock ? "On" : "Off");
             else if (i == 4) snprintf(line, sizeof(line), "%-16s %u frames", "OC Trigger",
                                        g_settings.overclock_trigger_dupes);
-            else snprintf(line, sizeof(line), "%-16s %u frames", "OC Boost",
-                          g_settings.overclock_boost_frames);
+            else if (i == 5) snprintf(line, sizeof(line), "%-16s %u frames", "OC Boost",
+                                       g_settings.overclock_boost_frames);
+            else snprintf(line, sizeof(line), "%-16s %s", "CRT Mode",
+                          g_settings.crt_mode ? "On" : "Off");
         } else {
             char ext[16];
             const char *name;
@@ -533,15 +563,31 @@ static void draw_menu(u32 *fb, u32 stride) {
 static void draw_hud(u32 *fb, u32 stride, u32 canvas_h, int x0, int y0) {
     AudioStats as;
     audio_stats(&as);
-    char line[56];
-    snprintf(line, sizeof(line), "FPS %u.%u  AUDIO %ums  LAG %u%%%s",
+    char line1[80], line2[48];
+    // g_use_gpu reflects the backend actually running this session (settings
+    // hw_accel is only the *request* — gpu_video_init may have failed and
+    // silently fallen back to CPU, see main()'s init), not just the setting.
+    // Resolution: the GPU path tracks dock/handheld live (gpu_video.c); the
+    // CPU path stays fixed at FB_W x FB_H always (see settings.h).
+    unsigned res_w = FB_W, res_h = FB_H;
+    if (g_use_gpu) gpu_video_get_resolution(&res_w, &res_h);
+    snprintf(line1, sizeof(line1), "%s %ux%u  FPS %u.%u  AUDIO %ums  LAG %u%%%s",
+             g_use_gpu ? "GPU" : "CPU", res_w, res_h,
              g_fps_x10 / 10, g_fps_x10 % 10, (as.ring_frames + as.inflight_frames) / 48,
              g_lag_pct, g_overclock_boost ? "  OC" : "");
+    // Direct retro_run() timing — see run_timing_tick's comment for why this
+    // exists alongside (and is more trustworthy than) LAG %.
+    unsigned avg_x10 = g_run_avg_us / 100, max_x10 = g_run_max_us / 100;  // tenths of a ms
+    snprintf(line2, sizeof(line2), "RUN avg %u.%ums  max %u.%ums",
+             avg_x10 / 10, avg_x10 % 10, max_x10 / 10, max_x10 % 10);
 
     const int scale = 2;
-    int w = osd_text_w(line, scale) + 24, h = 8 * scale + 16;
+    int lh = 8 * scale + 6;
+    int w1 = osd_text_w(line1, scale), w2 = osd_text_w(line2, scale);
+    int w = (w1 > w2 ? w1 : w2) + 24, h = lh * 2 + 12;
     osd_rect(fb, stride, canvas_h, x0, y0, w, h, 0xFF181818u);
-    osd_text(fb, stride, canvas_h, x0 + 12, y0 + 8, 0xFFFFFFFFu, scale, line);
+    osd_text(fb, stride, canvas_h, x0 + 12, y0 + 6, 0xFFFFFFFFu, scale, line1);
+    osd_text(fb, stride, canvas_h, x0 + 12, y0 + 6 + lh, 0xFFFFFFFFu, scale, line2);
 }
 
 // GPU-path only: builds the paused-menu backdrop (native-res frame nearest-
@@ -660,6 +706,7 @@ int main(int argc, char **argv) {
     if (g_use_gpu) {
         g_menu_frame = malloc((size_t)FB_W * FB_H * sizeof(u32));
         g_hud_frame = malloc((size_t)HUD_W * HUD_H * sizeof(u32));
+        gpu_video_set_crt(g_settings.crt_mode);
     } else {
         framebufferCreate(&g_fb, win, FB_W, FB_H, PIXEL_FORMAT_RGBA_8888, 2);
         framebufferMakeLinear(&g_fb);
@@ -706,7 +753,9 @@ int main(int argc, char **argv) {
             g_menu_sel = 0;
         } else {
             g_held = padGetButtons(&pad);
+            u64 run_t0 = armGetSystemTick();
             retro_run();                // advances the game, fills g_frame
+            run_timing_tick((unsigned)(armTicksToNs(armGetSystemTick() - run_t0) / 1000));
             fps_tick();                 // only counts real gameplay frames
             frame++;
             if (frame % 600 == 0)    sram_save();          // SRAM ~every 10s

@@ -16,9 +16,10 @@
 
 // The small HUD panel's fixed pixel size (shared with main.c, which builds the
 // panel's pixels via osd_rect/osd_text before handing them to gpu_video_set_hud).
-// Wide enough for "FPS 60.0  AUDIO 100ms  LAG 100%  OC" at scale 2 plus padding.
-#define HUD_W 620
-#define HUD_H 56
+// Wide enough for "GPU 1920x1080  FPS 60.0  AUDIO 100ms  LAG 100%  OC" at
+// scale 2 plus padding; tall enough for that plus a second "RUN avg/max" line.
+#define HUD_W 700
+#define HUD_H 64
 
 bool gpu_video_init(NWindow *win);
 
@@ -35,6 +36,16 @@ void gpu_video_set_hud(const uint32_t *rgba8, unsigned w, unsigned h);
 // Sets/clears the full 1280x720 opaque paused-menu backdrop (replaces the game
 // window + HUD entirely while visible); NULL hides it.
 void gpu_video_set_overlay(const uint32_t *rgba_1280x720);
+
+// Toggles the CRT look (scanlines/phosphor mask/vignette — see crt_fsh.glsl)
+// for the game quad only; HUD/menu overlay are unaffected. Live, no restart —
+// a no-op if gpu_video_init hasn't succeeded.
+void gpu_video_set_crt(bool enabled);
+
+// Current swapchain resolution (1280x720 handheld / 1920x1080 docked, tracked
+// live — see resize_swapchain in gpu_video.c). Defaults to 1280x720 if called
+// before gpu_video_init.
+void gpu_video_get_resolution(unsigned *w, unsigned *h);
 
 // Uploads whatever changed since the last call, draws, and presents. Call once
 // per main-loop iteration, whether or not a new game frame arrived that tick

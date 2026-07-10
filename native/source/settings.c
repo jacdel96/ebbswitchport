@@ -17,6 +17,7 @@ void settings_load(Settings *out) {
     out->dynamic_overclock = true;
     out->overclock_trigger_dupes = 5;
     out->overclock_boost_frames = 100;
+    out->crt_mode = false;
 
     FILE *f = fopen(SETTINGS_PATH, "rb");
     if (!f) return;
@@ -29,6 +30,7 @@ void settings_load(Settings *out) {
         else if (sscanf(line, "dynamic_overclock=%d", &v) == 1) out->dynamic_overclock = v != 0;
         else if (sscanf(line, "overclock_trigger_dupes=%d", &v) == 1) out->overclock_trigger_dupes = (unsigned)v;
         else if (sscanf(line, "overclock_boost_frames=%d", &v) == 1) out->overclock_boost_frames = (unsigned)v;
+        else if (sscanf(line, "crt_mode=%d", &v) == 1) out->crt_mode = v != 0;
     }
     fclose(f);
 }
@@ -39,9 +41,10 @@ void settings_save(const Settings *s) {
     FILE *f = fopen(SETTINGS_TMP, "wb");
     if (!f) return;
     fprintf(f, "hw_accel=%d\naudio_buffer_ms=%u\nshow_hud=%d\ndynamic_overclock=%d\n"
-               "overclock_trigger_dupes=%u\noverclock_boost_frames=%u\n",
+               "overclock_trigger_dupes=%u\noverclock_boost_frames=%u\ncrt_mode=%d\n",
             s->hw_accel ? 1 : 0, s->audio_buffer_ms, s->show_hud ? 1 : 0,
-            s->dynamic_overclock ? 1 : 0, s->overclock_trigger_dupes, s->overclock_boost_frames);
+            s->dynamic_overclock ? 1 : 0, s->overclock_trigger_dupes, s->overclock_boost_frames,
+            s->crt_mode ? 1 : 0);
     fclose(f);
     remove(SETTINGS_PATH);
     rename(SETTINGS_TMP, SETTINGS_PATH);

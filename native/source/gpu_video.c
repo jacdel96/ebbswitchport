@@ -5,13 +5,39 @@
 #include <string.h>
 #include <deko3d.h>
 
-// --- layout constants (mirror main.c's FB_W/H and DST_X0/Y0/W/H) -------------
-#define FB_W 1280
-#define FB_H 720
-#define DST_W 960
-#define DST_H 720
-#define DST_X0 ((FB_W - DST_W) / 2)
-#define DST_Y0 ((FB_H - DST_H) / 2)
+// --- layout constants ---------------------------------------------------------
+// Unlike the CPU Framebuffer path (which stays fixed at 720p always — see
+// settings.h), the GPU swapchain tracks dock/handheld live: 720p handheld,
+// 1080p docked. g_fb_w/h is the swapchain's CURRENT resolution; the game
+// quad's position/size (g_dst_*) is recomputed to match on every resize.
+// The overlay/menu-backdrop texture stays fixed at OVERLAY_W x OVERLAY_H
+// regardless — main.c always builds it at that size, and it's just sampled
+// by a bigger or smaller output viewport, no different from any other scaled
+// texture (see gpu_video_present's overlay draw).
+#define FB_W_HANDHELD 1280
+#define FB_H_HANDHELD 720
+#define FB_W_DOCKED   1920
+#define FB_H_DOCKED   1080
+#define OVERLAY_W 1280
+#define OVERLAY_H 720
+static unsigned g_fb_w = FB_W_HANDHELD, g_fb_h = FB_H_HANDHELD;
+static int g_dst_x0, g_dst_y0;
+static unsigned g_dst_w, g_dst_h;
+
+static void resolution_for_mode(unsigned *w, unsigned *h) {
+    if (appletGetOperationMode() == AppletOperationMode_Console) { *w = FB_W_DOCKED; *h = FB_H_DOCKED; }
+    else { *w = FB_W_HANDHELD; *h = FB_H_HANDHELD; }
+}
+
+// The game window keeps the same 4:3-within-16:9 framing at every resolution
+// (960x720-in-1280x720 and 1440x1080-in-1920x1080 are the same proportions —
+// docked is an exact 1.5x scale of handheld here — so one formula covers both).
+static void compute_dst_layout(void) {
+    g_dst_h = g_fb_h;
+    g_dst_w = g_fb_h * 4 / 3;
+    g_dst_x0 = (int)(g_fb_w - g_dst_w) / 2;
+    g_dst_y0 = 0;
+}
 
 // Worst-case core output size (SNES is at most ~512x478 in hi-res/interlaced
 // modes); the game texture is allocated once at this size and only its
@@ -37,13 +63,18 @@ static bool g_ready = false;
 static DkDevice g_device;
 static DkQueue g_queue;
 
+static NWindow *g_win;
 static DkMemBlock g_fbMemBlock;
 static DkImage g_fbImages[N_FB];
+static DkImage g_fbImagesStaging[N_FB];  // resize_swapchain's scratch; static so it
+                                          // never dangles regardless of whether
+                                          // dkSwapchainCreate retains the pointers
 static DkSwapchain g_swapchain;
 
 static DkMemBlock g_codeMemBlock;
 static uint32_t g_codeMemOffset;
-static DkShader g_vsh, g_fsh;
+static DkShader g_vsh, g_fsh, g_crtFsh;
+static bool g_crt_enabled = false;
 
 static DkMemBlock g_gameImgMem;
 static DkImage g_gameImage;
@@ -126,11 +157,13 @@ static DkMemBlock make_memblock(uint32_t size, uint32_t flags) {
 // (same memblock, same offset — just a new logical layout), then rewrites its
 // descriptor. Returns false if w/h are out of range or allocation fails.
 static bool init_or_resize_image(DkImage *image, DkMemBlock *mem, unsigned w, unsigned h,
-                                  unsigned max_w, unsigned max_h, unsigned slot, bool first_time) {
+                                  unsigned max_w, unsigned max_h, unsigned slot, bool first_time,
+                                  uint32_t extra_flags) {
     if (w == 0 || h == 0 || w > max_w || h > max_h) return false;
 
     DkImageLayoutMaker lm;
     dkImageLayoutMakerDefaults(&lm, g_device);
+    lm.flags = extra_flags;
     lm.format = DkImageFormat_RGBA8_Unorm;
     lm.dimensions[0] = w;
     lm.dimensions[1] = h;
@@ -198,8 +231,12 @@ bool gpu_video_init(NWindow *win) {
     g_cmdbuf = NULL;
     g_game_w = g_game_h = 0;
     g_hud_visible = g_overlay_visible = false;
+    g_crt_enabled = false;
     g_game_pending = g_hud_pending = g_overlay_pending = false;
     g_parity = 0;
+    g_win = win;
+    resolution_for_mode(&g_fb_w, &g_fb_h);  // start at whatever mode we're already in
+    compute_dst_layout();
 
     DkDeviceMaker devMaker;
     dkDeviceMakerDefaults(&devMaker);
@@ -212,15 +249,14 @@ bool gpu_video_init(NWindow *win) {
     g_queue = dkQueueCreate(&qMaker);
     if (!g_queue) { teardown(); return false; }
 
-    // Swapchain framebuffers, fixed at 1280x720 for the app's lifetime (the CPU
-    // Framebuffer path makes the same assumption — no dock/handheld resize
-    // logic exists on that side either, so this doesn't regress anything).
+    // Swapchain framebuffers, sized to the current dock/handheld resolution;
+    // gpu_video_present() polls for mode changes and calls resize_swapchain().
     DkImageLayoutMaker fbLm;
     dkImageLayoutMakerDefaults(&fbLm, g_device);
     fbLm.flags = DkImageFlags_UsageRender | DkImageFlags_UsagePresent | DkImageFlags_HwCompression;
     fbLm.format = DkImageFormat_RGBA8_Unorm;
-    fbLm.dimensions[0] = FB_W;
-    fbLm.dimensions[1] = FB_H;
+    fbLm.dimensions[0] = g_fb_w;
+    fbLm.dimensions[1] = g_fb_h;
     DkImageLayout fbLayout;
     dkImageLayoutInitialize(&fbLayout, &fbLm);
     uint32_t fbSize = align_up((uint32_t)dkImageLayoutGetSize(&fbLayout),
@@ -244,7 +280,8 @@ bool gpu_video_init(NWindow *win) {
     if (!g_codeMemBlock) { teardown(); return false; }
     g_codeMemOffset = 0;
     if (!load_shader(&g_vsh, "romfs:/shaders/fullscreen_vsh.dksh") ||
-        !load_shader(&g_fsh, "romfs:/shaders/texture_fsh.dksh")) {
+        !load_shader(&g_fsh, "romfs:/shaders/texture_fsh.dksh") ||
+        !load_shader(&g_crtFsh, "romfs:/shaders/crt_fsh.dksh")) {
         teardown();
         return false;
     }
@@ -256,16 +293,16 @@ bool gpu_video_init(NWindow *win) {
 
     // Game/HUD/overlay textures + their double-buffered CPU-visible staging.
     if (!init_or_resize_image(&g_gameImage, &g_gameImgMem, GAME_MAX_W, GAME_MAX_H,
-                               GAME_MAX_W, GAME_MAX_H, IMG_GAME, true)) { teardown(); return false; }
+                               GAME_MAX_W, GAME_MAX_H, IMG_GAME, true, 0)) { teardown(); return false; }
     g_game_w = g_game_h = 0;  // force a real (re)init on the first real upload
     if (!init_or_resize_image(&g_hudImage, &g_hudImgMem, HUD_W, HUD_H,
-                               HUD_W, HUD_H, IMG_HUD, true)) { teardown(); return false; }
-    if (!init_or_resize_image(&g_overlayImage, &g_overlayImgMem, FB_W, FB_H,
-                               FB_W, FB_H, IMG_OVERLAY, true)) { teardown(); return false; }
+                               HUD_W, HUD_H, IMG_HUD, true, 0)) { teardown(); return false; }
+    if (!init_or_resize_image(&g_overlayImage, &g_overlayImgMem, OVERLAY_W, OVERLAY_H,
+                               OVERLAY_W, OVERLAY_H, IMG_OVERLAY, true, 0)) { teardown(); return false; }
 
     uint32_t gameScratchSize = GAME_MAX_W * GAME_MAX_H * 4;
     uint32_t hudScratchSize = HUD_W * HUD_H * 4;
-    uint32_t overlayScratchSize = FB_W * FB_H * 4;
+    uint32_t overlayScratchSize = OVERLAY_W * OVERLAY_H * 4;
     for (int i = 0; i < N_PARITY; i++) {
         g_gameScratch[i] = make_memblock(gameScratchSize, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
         g_hudScratch[i] = make_memblock(hudScratchSize, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
@@ -316,7 +353,7 @@ void gpu_video_upload_frame(const uint32_t *rgba8, unsigned w, unsigned h) {
         // in-flight command list still referencing the old layout.
         dkQueueWaitIdle(g_queue);
         if (!init_or_resize_image(&g_gameImage, &g_gameImgMem, w, h,
-                                   GAME_MAX_W, GAME_MAX_H, IMG_GAME, false))
+                                   GAME_MAX_W, GAME_MAX_H, IMG_GAME, false, 0))
             return;
         g_game_w = w; g_game_h = h;
     }
@@ -339,9 +376,19 @@ void gpu_video_set_overlay(const uint32_t *rgba_1280x720) {
     if (!g_ready) return;
     if (!rgba_1280x720) { g_overlay_visible = false; return; }
     void *dst = dkMemBlockGetCpuAddr(g_overlayScratch[g_parity]);
-    memcpy(dst, rgba_1280x720, (size_t)FB_W * FB_H * sizeof(uint32_t));
+    memcpy(dst, rgba_1280x720, (size_t)OVERLAY_W * OVERLAY_H * sizeof(uint32_t));
     g_overlay_pending = true;
     g_overlay_visible = true;
+}
+
+void gpu_video_set_crt(bool enabled) {
+    if (!g_ready) return;
+    g_crt_enabled = enabled;
+}
+
+void gpu_video_get_resolution(unsigned *w, unsigned *h) {
+    *w = g_fb_w;
+    *h = g_fb_h;
 }
 
 // Draws one full-screen-quad-shader textured rect into the given viewport,
@@ -356,8 +403,59 @@ static void draw_textured_quad(unsigned slot, int x, int y, int w, int h) {
     dkCmdBufDraw(g_cmdbuf, DkPrimitive_TriangleStrip, 4, 1, 0, 0);
 }
 
+// Recreates the swapchain + its framebuffer images at new_w x new_h (a real
+// dock/handheld transition). Builds the new swapchain BEFORE touching the old
+// one, so a failure here (allocation, API error) just leaves the old
+// resolution running rather than risking ending up with no swapchain at all —
+// only commits to the new state once every step has actually succeeded.
+static void resize_swapchain(unsigned new_w, unsigned new_h) {
+    DkImageLayoutMaker fbLm;
+    dkImageLayoutMakerDefaults(&fbLm, g_device);
+    fbLm.flags = DkImageFlags_UsageRender | DkImageFlags_UsagePresent | DkImageFlags_HwCompression;
+    fbLm.format = DkImageFormat_RGBA8_Unorm;
+    fbLm.dimensions[0] = new_w;
+    fbLm.dimensions[1] = new_h;
+    DkImageLayout fbLayout;
+    dkImageLayoutInitialize(&fbLayout, &fbLm);
+    uint32_t fbSize = align_up((uint32_t)dkImageLayoutGetSize(&fbLayout),
+                                dkImageLayoutGetAlignment(&fbLayout));
+
+    DkMemBlock newMem = make_memblock(fbSize * N_FB, DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image);
+    if (!newMem) return;  // keep running at the old resolution
+
+    DkImage const *newPtrs[N_FB];
+    for (int i = 0; i < N_FB; i++) {
+        newPtrs[i] = &g_fbImagesStaging[i];
+        dkImageInitialize(&g_fbImagesStaging[i], &fbLayout, newMem, i * fbSize);
+    }
+
+    DkSwapchainMaker scMaker;
+    dkSwapchainMakerDefaults(&scMaker, g_device, g_win, newPtrs, N_FB);
+    DkSwapchain newSwapchain = dkSwapchainCreate(&scMaker);
+    if (!newSwapchain) { dkMemBlockDestroy(newMem); return; }  // keep running at the old resolution
+
+    // New resources are confirmed working — safe to drop the old ones now.
+    dkSwapchainDestroy(g_swapchain);
+    dkMemBlockDestroy(g_fbMemBlock);
+
+    g_swapchain = newSwapchain;
+    g_fbMemBlock = newMem;
+    memcpy(g_fbImages, g_fbImagesStaging, sizeof(g_fbImages));
+    g_fb_w = new_w;
+    g_fb_h = new_h;
+    compute_dst_layout();
+}
+
 void gpu_video_present(void) {
     if (!g_ready) return;
+
+    // Cheap to poll every frame; only actually resizes on a real dock/handheld
+    // change. Safe to touch swapchain resources here with no extra wait: the
+    // GPU is guaranteed idle at this point, either from init's own wait or
+    // from the trailing dkQueueWaitIdle at the end of every previous call.
+    unsigned want_w, want_h;
+    resolution_for_mode(&want_w, &want_h);
+    if (want_w != g_fb_w || want_h != g_fb_h) resize_swapchain(want_w, want_h);
 
     int slot = dkQueueAcquireImage(g_queue, g_swapchain);
 
@@ -391,7 +489,7 @@ void gpu_video_present(void) {
         DkCopyBuf src = { dkMemBlockGetGpuAddr(g_overlayScratch[g_parity]), 0, 0 };
         DkImageView view;
         dkImageViewDefaults(&view, &g_overlayImage);
-        DkImageRect rect = { 0, 0, 0, FB_W, FB_H, 1 };
+        DkImageRect rect = { 0, 0, 0, OVERLAY_W, OVERLAY_H, 1 };
         dkCmdBufCopyBufferToImage(g_cmdbuf, &src, &view, &rect, 0);
     }
     if (any_pending) dkCmdBufBarrier(g_cmdbuf, DkBarrier_Full, DkInvalidateFlags_Image);
@@ -400,14 +498,15 @@ void gpu_video_present(void) {
     dkImageViewDefaults(&fbView, &g_fbImages[slot]);
     dkCmdBufBindRenderTarget(g_cmdbuf, &fbView, NULL);
 
-    DkViewport fullVp = { 0.0f, 0.0f, (float)FB_W, (float)FB_H, 0.0f, 1.0f };
-    DkScissor fullSc = { 0, 0, FB_W, FB_H };
+    DkViewport fullVp = { 0.0f, 0.0f, (float)g_fb_w, (float)g_fb_h, 0.0f, 1.0f };
+    DkScissor fullSc = { 0, 0, g_fb_w, g_fb_h };
     dkCmdBufSetViewports(g_cmdbuf, 0, &fullVp, 1);
     dkCmdBufSetScissors(g_cmdbuf, 0, &fullSc, 1);
     dkCmdBufClearColorFloat(g_cmdbuf, 0, DkColorMask_RGBA, 0.0f, 0.0f, 0.0f, 1.0f);
 
-    DkShader const *shaders[] = { &g_vsh, &g_fsh };
-    dkCmdBufBindShaders(g_cmdbuf, DkStageFlag_GraphicsMask, shaders, 2);
+    DkShader const *plainShaders[] = { &g_vsh, &g_fsh };
+    DkShader const *crtShaders[] = { &g_vsh, &g_crtFsh };
+    dkCmdBufBindShaders(g_cmdbuf, DkStageFlag_GraphicsMask, plainShaders, 2);
     DkRasterizerState rs; dkRasterizerStateDefaults(&rs);
     DkColorState cs; dkColorStateDefaults(&cs);
     DkColorWriteState cws; dkColorWriteStateDefaults(&cws);
@@ -415,12 +514,17 @@ void gpu_video_present(void) {
     dkCmdBufBindColorState(g_cmdbuf, &cs);
     dkCmdBufBindColorWriteState(g_cmdbuf, &cws);
 
-    if (g_game_w && g_game_h)
-        draw_textured_quad(IMG_GAME, DST_X0, DST_Y0, DST_W, DST_H);
+    if (g_game_w && g_game_h) {
+        // CRT look applies only to the game quad — HUD/menu overlay stay on
+        // the plain shader, so rebind around just this draw.
+        if (g_crt_enabled) dkCmdBufBindShaders(g_cmdbuf, DkStageFlag_GraphicsMask, crtShaders, 2);
+        draw_textured_quad(IMG_GAME, g_dst_x0, g_dst_y0, (int)g_dst_w, (int)g_dst_h);
+        if (g_crt_enabled) dkCmdBufBindShaders(g_cmdbuf, DkStageFlag_GraphicsMask, plainShaders, 2);
+    }
     if (g_hud_visible)
         draw_textured_quad(IMG_HUD, 16, 16, HUD_W, HUD_H);
     if (g_overlay_visible)
-        draw_textured_quad(IMG_OVERLAY, 0, 0, FB_W, FB_H);
+        draw_textured_quad(IMG_OVERLAY, 0, 0, (int)g_fb_w, (int)g_fb_h);
 
     DkCmdList list = dkCmdBufFinishList(g_cmdbuf);
     dkQueueSubmitCommands(g_queue, list);
