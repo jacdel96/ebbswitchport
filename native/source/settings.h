@@ -18,6 +18,15 @@ typedef struct {
     bool     ai_upscale;       // experimental ESPCN super-resolution on the game quad;
                                 // GPU-path only, only does anything if a local (unshipped,
                                 // see gpu_video.h) weights file is present; default off
+    char     net_host[64];        // "ip:port" of the laptop running net_upscale_server.py;
+                                    // empty = not configured yet
+    char     net_pairing_code[64]; // shared secret for the network-upscale handshake (see
+                                    // net_upscale.h) — persisted, unlike net_upscale itself,
+                                    // so it doesn't need retyping every session
+    bool     net_upscale;      // experimental: offload AI Upscale to the network instead
+                                // of the local GPU (see net_upscale.h); mutually exclusive
+                                // with ai_upscale — enabling one clears the other; never
+                                // persisted, same reasoning as ai_upscale
 } Settings;
 
 // Fills *out with defaults, then overrides from sdmc:/switch/ebbswitchport/settings.cfg

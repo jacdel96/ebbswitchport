@@ -22,12 +22,16 @@ void settings_load(Settings *out) {
                                // an explicit opt-in each session, regardless of what
                                // was last saved; see the "N/A"/crash-risk notes on
                                // gpu_video_set_ai_upscale.
+    out->net_host[0] = '\0';
+    out->net_pairing_code[0] = '\0';
+    out->net_upscale = false;  // never persisted, same reasoning as ai_upscale above
 
     FILE *f = fopen(SETTINGS_PATH, "rb");
     if (!f) return;
-    char line[64];
+    char line[160];
     while (fgets(line, sizeof(line), f)) {
         int v;
+        char sval[64];
         if (sscanf(line, "hw_accel=%d", &v) == 1) out->hw_accel = v != 0;
         else if (sscanf(line, "audio_buffer_ms=%d", &v) == 1) out->audio_buffer_ms = (unsigned)v;
         else if (sscanf(line, "show_hud=%d", &v) == 1) out->show_hud = v != 0;
@@ -35,7 +39,9 @@ void settings_load(Settings *out) {
         else if (sscanf(line, "overclock_trigger_dupes=%d", &v) == 1) out->overclock_trigger_dupes = (unsigned)v;
         else if (sscanf(line, "overclock_boost_frames=%d", &v) == 1) out->overclock_boost_frames = (unsigned)v;
         else if (sscanf(line, "crt_mode=%d", &v) == 1) out->crt_mode = v != 0;
-        // ai_upscale intentionally not read back — always starts false.
+        else if (sscanf(line, "net_host=%63[^\n]", sval) == 1) snprintf(out->net_host, sizeof(out->net_host), "%s", sval);
+        else if (sscanf(line, "net_pairing_code=%63[^\n]", sval) == 1) snprintf(out->net_pairing_code, sizeof(out->net_pairing_code), "%s", sval);
+        // ai_upscale/net_upscale intentionally not read back — always start false.
     }
     fclose(f);
 }
@@ -45,12 +51,13 @@ void settings_save(const Settings *s) {
     mkdir(SETTINGS_DIR, 0777);
     FILE *f = fopen(SETTINGS_TMP, "wb");
     if (!f) return;
-    // ai_upscale intentionally not written — never persisted, see settings_load.
+    // ai_upscale/net_upscale intentionally not written — never persisted, see settings_load.
     fprintf(f, "hw_accel=%d\naudio_buffer_ms=%u\nshow_hud=%d\ndynamic_overclock=%d\n"
-               "overclock_trigger_dupes=%u\noverclock_boost_frames=%u\ncrt_mode=%d\n",
+               "overclock_trigger_dupes=%u\noverclock_boost_frames=%u\ncrt_mode=%d\n"
+               "net_host=%s\nnet_pairing_code=%s\n",
             s->hw_accel ? 1 : 0, s->audio_buffer_ms, s->show_hud ? 1 : 0,
             s->dynamic_overclock ? 1 : 0, s->overclock_trigger_dupes, s->overclock_boost_frames,
-            s->crt_mode ? 1 : 0);
+            s->crt_mode ? 1 : 0, s->net_host, s->net_pairing_code);
     fclose(f);
     remove(SETTINGS_PATH);
     rename(SETTINGS_TMP, SETTINGS_PATH);

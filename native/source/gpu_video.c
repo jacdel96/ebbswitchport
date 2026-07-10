@@ -146,6 +146,16 @@ static bool g_espcn_have_output = false; // g_espcnOutImage holds a valid result
                                           // dupe-frame skip (this is what makes reusing it correct
                                           // rather than stale garbage on the very first run).
 
+// --- network AI-upscale state ---------------------------------------------------
+// Alternative source for IMG_ESPCN_OUT (see gpu_video.h) — mutually exclusive
+// with the local compute path at runtime, enforced by main.c only ever
+// enabling one of the two settings at a time.
+static bool g_network_enabled = false;
+static bool g_network_have_output = false;
+static bool g_network_pending = false;
+static unsigned g_network_pending_w = 0, g_network_pending_h = 0;
+static DkMemBlock g_networkScratch[N_PARITY];  // CPU-visible RGBA8 recombine target
+
 static DkMemBlock g_cmdbufMemBlock;
 static DkCmdBuf g_cmdbuf;
 
@@ -239,6 +249,7 @@ static void teardown(void) {
         if (g_overlayScratch[i]) dkMemBlockDestroy(g_overlayScratch[i]);
         if (g_hudScratch[i]) dkMemBlockDestroy(g_hudScratch[i]);
         if (g_gameScratch[i]) dkMemBlockDestroy(g_gameScratch[i]);
+        if (g_networkScratch[i]) dkMemBlockDestroy(g_networkScratch[i]);
     }
     if (g_overlayImgMem) dkMemBlockDestroy(g_overlayImgMem);
     if (g_hudImgMem) dkMemBlockDestroy(g_hudImgMem);
@@ -264,6 +275,7 @@ static void teardown(void) {
     memset(g_gameScratch, 0, sizeof(g_gameScratch));
     memset(g_hudScratch, 0, sizeof(g_hudScratch));
     memset(g_overlayScratch, 0, sizeof(g_overlayScratch));
+    memset(g_networkScratch, 0, sizeof(g_networkScratch));
     g_descMemBlock = NULL;
     g_cmdbufMemBlock = NULL;
     g_cmdbuf = NULL;
@@ -281,6 +293,7 @@ bool gpu_video_init(NWindow *win) {
     memset(g_gameScratch, 0, sizeof(g_gameScratch));
     memset(g_hudScratch, 0, sizeof(g_hudScratch));
     memset(g_overlayScratch, 0, sizeof(g_overlayScratch));
+    memset(g_networkScratch, 0, sizeof(g_networkScratch));
     g_descMemBlock = NULL;
     g_cmdbufMemBlock = NULL;
     g_cmdbuf = NULL;
@@ -294,6 +307,9 @@ bool gpu_video_init(NWindow *win) {
     g_espcnWeights = g_espcnDimsUbo = g_espcnFeat1Mem = g_espcnFeat2Mem = g_espcnOutImgMem = NULL;
     g_espcn_last_us = 0;
     g_espcn_have_output = false;
+    g_network_enabled = false;
+    g_network_have_output = false;
+    g_network_pending = false;
     g_win = win;
     resolution_for_mode(&g_fb_w, &g_fb_h);  // start at whatever mode we're already in
     compute_dst_layout();
@@ -374,11 +390,13 @@ bool gpu_video_init(NWindow *win) {
     uint32_t gameScratchSize = GAME_MAX_W * GAME_MAX_H * 4;
     uint32_t hudScratchSize = HUD_W * HUD_H * 4;
     uint32_t overlayScratchSize = OVERLAY_W * OVERLAY_H * 4;
+    uint32_t networkScratchSize = (ESPCN_MAX_W * ESPCN_SCALE) * (ESPCN_MAX_H * ESPCN_SCALE) * 4;
     for (int i = 0; i < N_PARITY; i++) {
         g_gameScratch[i] = make_memblock(gameScratchSize, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
         g_hudScratch[i] = make_memblock(hudScratchSize, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
         g_overlayScratch[i] = make_memblock(overlayScratchSize, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
-        if (!g_gameScratch[i] || !g_hudScratch[i] || !g_overlayScratch[i]) { teardown(); return false; }
+        g_networkScratch[i] = make_memblock(networkScratchSize, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
+        if (!g_gameScratch[i] || !g_hudScratch[i] || !g_overlayScratch[i] || !g_networkScratch[i]) { teardown(); return false; }
     }
 
     // Sampler: nearest filtering (the default) is exactly the CPU path's
@@ -604,6 +622,65 @@ bool gpu_video_ai_upscale_available(void) {
     return g_espcn_available;
 }
 
+void gpu_video_set_network_upscale(bool enabled) {
+    if (!g_ready) return;
+    if (enabled && !g_network_enabled) g_network_have_output = false;  // see
+                                        // gpu_video_set_ai_upscale's identical
+                                        // reasoning: force a fresh result
+                                        // rather than reusing a stale one.
+    g_network_enabled = enabled;
+}
+
+bool gpu_video_network_upscale_active(void) {
+    return g_network_enabled && g_network_have_output;
+}
+
+// Recombines a network-upscaled luma plane with the original small frame's
+// color into RGB (same YCbCr math as espcn3_comp.glsl's tail, just run on
+// the CPU instead of the GPU) and stages it for upload into the same output
+// slot the local compute path uses. w/h must exactly match the current game
+// resolution scaled by ESPCN_SCALE — anything else is a stale response for
+// a since-changed resolution and is dropped rather than risking sampling
+// g_gameScratch out of bounds.
+void gpu_video_upload_network_result(const uint8_t *luma, unsigned w, unsigned h) {
+    if (!g_ready || !luma || !g_network_enabled) return;
+    if (g_game_w == 0 || w != g_game_w * ESPCN_SCALE || h != g_game_h * ESPCN_SCALE) return;
+    if (w > ESPCN_MAX_W * ESPCN_SCALE || h > ESPCN_MAX_H * ESPCN_SCALE) return;
+
+    const uint32_t *src = (const uint32_t *)dkMemBlockGetCpuAddr(g_gameScratch[g_parity]);
+    uint32_t *dst = (uint32_t *)dkMemBlockGetCpuAddr(g_networkScratch[g_parity]);
+
+    for (unsigned oy = 0; oy < h; oy++) {
+        unsigned sy = oy / ESPCN_SCALE;
+        for (unsigned ox = 0; ox < w; ox++) {
+            unsigned sx = ox / ESPCN_SCALE;
+            uint32_t srgba = src[sy * g_game_w + sx];
+            float r = (float)(srgba & 0xFF) / 255.0f;
+            float g = (float)((srgba >> 8) & 0xFF) / 255.0f;
+            float b = (float)((srgba >> 16) & 0xFF) / 255.0f;
+            float cb = -0.168736f * r - 0.331264f * g + 0.5f * b + 0.5f;
+            float cr = 0.5f * r - 0.418688f * g - 0.081312f * b + 0.5f;
+            float yNew = (float)luma[oy * w + ox] / 255.0f;
+
+            float rr = yNew + 1.402f * (cr - 0.5f);
+            float gg = yNew - 0.344136f * (cb - 0.5f) - 0.714136f * (cr - 0.5f);
+            float bb = yNew + 1.772f * (cb - 0.5f);
+            rr = rr < 0.0f ? 0.0f : (rr > 1.0f ? 1.0f : rr);
+            gg = gg < 0.0f ? 0.0f : (gg > 1.0f ? 1.0f : gg);
+            bb = bb < 0.0f ? 0.0f : (bb > 1.0f ? 1.0f : bb);
+
+            uint32_t out = 0xFF000000u |
+                           ((uint32_t)(bb * 255.0f + 0.5f) << 16) |
+                           ((uint32_t)(gg * 255.0f + 0.5f) << 8) |
+                           (uint32_t)(rr * 255.0f + 0.5f);
+            dst[oy * w + ox] = out;
+        }
+    }
+    g_network_pending_w = w;
+    g_network_pending_h = h;
+    g_network_pending = true;
+}
+
 // Runs the 3 ESPCN compute passes (espcn1/2/3_comp.glsl) against the current
 // game frame, writing the result to g_espcnOutImage. Deliberately its own
 // synchronous submission rather than folded into the main per-frame command
@@ -709,13 +786,25 @@ void gpu_video_present(void) {
     // Upload whatever changed since the last present, then a single barrier
     // before any of this frame's draws sample those images (copy-engine
     // writes aren't automatically visible to the texture unit otherwise).
-    bool any_pending = g_game_pending || g_hud_pending || g_overlay_pending;
+    bool any_pending = g_game_pending || g_hud_pending || g_overlay_pending || g_network_pending;
     if (g_game_pending) {
         DkCopyBuf src = { dkMemBlockGetGpuAddr(g_gameScratch[g_parity]), 0, 0 };
         DkImageView view;
         dkImageViewDefaults(&view, &g_gameImage);
         DkImageRect rect = { 0, 0, 0, g_pending_game_w, g_pending_game_h, 1 };
         dkCmdBufCopyBufferToImage(g_cmdbuf, &src, &view, &rect, 0);
+    }
+    if (g_network_pending) {
+        // Same output slot the local ESPCN compute path writes — see
+        // gpu_video.h. Uploaded via the CPU-recombined buffer instead of a
+        // compute dispatch.
+        DkCopyBuf src = { dkMemBlockGetGpuAddr(g_networkScratch[g_parity]), 0, 0 };
+        DkImageView view;
+        dkImageViewDefaults(&view, &g_espcnOutImage);
+        DkImageRect rect = { 0, 0, 0, g_network_pending_w, g_network_pending_h, 1 };
+        dkCmdBufCopyBufferToImage(g_cmdbuf, &src, &view, &rect, 0);
+        g_network_have_output = true;
+        g_network_pending = false;
     }
     if (g_hud_pending) {
         DkCopyBuf src = { dkMemBlockGetGpuAddr(g_hudScratch[g_parity]), 0, 0 };
@@ -757,7 +846,7 @@ void gpu_video_present(void) {
         // CRT look applies only to the game quad — HUD/menu overlay stay on
         // the plain shader, so rebind around just this draw.
         if (g_crt_enabled) dkCmdBufBindShaders(g_cmdbuf, DkStageFlag_GraphicsMask, crtShaders, 2);
-        unsigned gameSrc = use_espcn ? IMG_ESPCN_OUT : IMG_GAME;
+        unsigned gameSrc = (use_espcn || gpu_video_network_upscale_active()) ? IMG_ESPCN_OUT : IMG_GAME;
         draw_textured_quad(gameSrc, g_dst_x0, g_dst_y0, (int)g_dst_w, (int)g_dst_h);
         if (g_crt_enabled) dkCmdBufBindShaders(g_cmdbuf, DkStageFlag_GraphicsMask, plainShaders, 2);
     }

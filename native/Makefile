@@ -53,10 +53,13 @@ LDFLAGS  = -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $
 # default since the GPU path hasn't run on real hardware yet; flip to 0 once
 # it's verified working, to switch to the release lib.
 DEKO3D_DEBUG ?= 1
+# mbedtls{,x509,crypto} (switch-mbedtls portlib) — ChaCha20-Poly1305/HKDF/HMAC
+# for the experimental network AI-upscale offload (net_upscale.c). Link order
+# matters: mbedtls depends on mbedx509, which depends on mbedcrypto.
 ifeq ($(DEKO3D_DEBUG),1)
-LIBS := -ldeko3dd -lsnes9x_libretro_libnx -lstdc++ -lnx -lm
+LIBS := -ldeko3dd -lsnes9x_libretro_libnx -lmbedtls -lmbedx509 -lmbedcrypto -lstdc++ -lnx -lm
 else
-LIBS := -ldeko3d -lsnes9x_libretro_libnx -lstdc++ -lnx -lm
+LIBS := -ldeko3d -lsnes9x_libretro_libnx -lmbedtls -lmbedx509 -lmbedcrypto -lstdc++ -lnx -lm
 endif
 
 # lib search: native/lib (core) + libnx.

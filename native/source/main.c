@@ -15,6 +15,7 @@
 #include "audio.h"
 #include "gpu_video.h"
 #include "libretro.h"
+#include "net_upscale.h"
 #include "osd.h"
 #include "pixfmt.h"
 #include "save_io.h"
@@ -53,8 +54,9 @@ static u32 *g_frame = NULL;
 #define SLOT_COUNT 10            // manual slots 0..9
 #define LOAD_COUNT (SLOT_COUNT + 2)  // + auto1 + auto10
 #define MAIN_COUNT 6             // Resume/Save/Load/Reset/Settings/Exit
-#define SETTINGS_COUNT 8         // Hardware Accel/Audio Buffer/Show HUD/Dynamic Overclock/
-                                  // OC Trigger/OC Boost/CRT Mode/AI Upscale
+#define SETTINGS_COUNT 10        // Hardware Accel/Audio Buffer/Show HUD/Dynamic Overclock/
+                                  // OC Trigger/OC Boost/CRT Mode/AI Upscale/
+                                  // Network Setup/Network Upscale
 static bool g_menu_open = false;
 static int g_menu_level = 0;
 static int g_menu_sel = 0;
@@ -207,6 +209,11 @@ static u32 *g_menu_frame = NULL;        // 1280x720 backdrop for the GPU-path me
 static u32 *g_hud_frame = NULL;         // small HUD_W x HUD_H panel for the GPU-path HUD
 static PixelLut g_pixlut = {0};         // shared 16bpp->RGBA8 LUT (CPU and GPU paths)
 
+// --- network AI-upscale state (see net_upscale.h) -----------------------------
+static bool g_net_initialized = false;  // net_upscale_init has been called this session
+static uint8_t *g_luma_buf = NULL;      // scratch: luma extracted from g_native_frame
+static unsigned g_luma_cap = 0;
+
 // --- libretro callbacks ------------------------------------------------------
 static void video_refresh(const void *data, unsigned width, unsigned height,
                           size_t pitch) {
@@ -224,6 +231,27 @@ static void video_refresh(const void *data, unsigned width, unsigned height,
         pixfmt_convert_to_rgba8(g_native_frame, data, width, height, pitch, g_px_fmt, &g_pixlut);
         g_native_w = width; g_native_h = height;
         gpu_video_upload_frame(g_native_frame, width, height);
+
+        if (g_settings.net_upscale && g_net_initialized) {
+            // Luma-only (see net_upscale.h) — same convention as espcn1_comp.glsl's
+            // luma extraction (matches the network's own model, which was only ever
+            // trained on the Y channel).
+            unsigned need = width * height;
+            if (need > g_luma_cap) {
+                free(g_luma_buf);
+                g_luma_buf = malloc(need);
+                g_luma_cap = need;
+            }
+            if (g_luma_buf) {
+                for (unsigned i = 0; i < need; i++) {
+                    u32 px = g_native_frame[i];
+                    float r = (float)(px & 0xFF), g = (float)((px >> 8) & 0xFF), b = (float)((px >> 16) & 0xFF);
+                    float y = 0.299f * r + 0.587f * g + 0.114f * b;
+                    g_luma_buf[i] = (uint8_t)(y < 0.0f ? 0.0f : (y > 255.0f ? 255.0f : y));
+                }
+                net_upscale_submit_frame(g_luma_buf, width, height);
+            }
+        }
         return;
     }
 
@@ -453,6 +481,30 @@ static bool state_exists(const char *ext) {
     return false;
 }
 
+// Shows the on-screen keyboard with the given header/guide/initial text;
+// returns true and fills `out` (up to out_size-1 bytes + NUL) if the user
+// confirmed, false (out left untouched) if they backed out. Blocks until the
+// applet closes — fine here since it's only ever invoked from the paused
+// Settings menu, never during gameplay.
+static bool text_entry(const char *header, const char *guide, const char *initial,
+                        char *out, size_t out_size) {
+    SwkbdConfig kbd;
+    if (R_FAILED(swkbdCreate(&kbd, 0))) return false;
+    swkbdConfigMakePresetDefault(&kbd);
+    swkbdConfigSetHeaderText(&kbd, header);
+    swkbdConfigSetGuideText(&kbd, guide);
+    if (initial && initial[0]) swkbdConfigSetInitialText(&kbd, initial);
+    swkbdConfigSetStringLenMax(&kbd, (u32)(out_size - 1));
+
+    char buf[64];
+    bool ok = R_SUCCEEDED(swkbdShow(&kbd, buf, sizeof(buf)));
+    swkbdClose(&kbd);
+    if (!ok) return false;
+    strncpy(out, buf, out_size - 1);
+    out[out_size - 1] = '\0';
+    return true;
+}
+
 // --- settings menu row helpers ------------------------------------------------
 // Adjusts the settings row `sel` by one step (dir = +1/-1), applies it live
 // where that's safe (audio buffer, HUD), and persists immediately.
@@ -494,6 +546,45 @@ static void settings_adjust(int sel, int dir) {
         if (g_use_gpu && gpu_video_ai_upscale_available()) {
             g_settings.ai_upscale = !g_settings.ai_upscale;
             gpu_video_set_ai_upscale(g_settings.ai_upscale);
+            // Mutually exclusive with the network path — both write the same
+            // GPU output slot (see gpu_video.h).
+            if (g_settings.ai_upscale && g_settings.net_upscale) {
+                g_settings.net_upscale = false;
+                gpu_video_set_network_upscale(false);
+            }
+        }
+    } else if (sel == 8) {
+        // Network Setup: enter the laptop's "ip:port" and the shared pairing
+        // code (see native/tools/net_upscale_server.py). Only takes effect
+        // the next time Network Upscale is turned on — doesn't reconnect an
+        // already-running session.
+        char host[64];
+        if (text_entry("Laptop address", "e.g. 192.168.1.42:9876",
+                        g_settings.net_host, host, sizeof(host))) {
+            strncpy(g_settings.net_host, host, sizeof(g_settings.net_host) - 1);
+            g_settings.net_host[sizeof(g_settings.net_host) - 1] = '\0';
+        }
+        char code[64];
+        if (text_entry("Pairing code", "must match the laptop's --pairing-code",
+                        g_settings.net_pairing_code, code, sizeof(code))) {
+            strncpy(g_settings.net_pairing_code, code, sizeof(g_settings.net_pairing_code) - 1);
+            g_settings.net_pairing_code[sizeof(g_settings.net_pairing_code) - 1] = '\0';
+        }
+    } else if (sel == 9) {
+        // Refuse to enable without a configured host/pairing code, and
+        // mutually exclusive with the local path (see sel==7's comment).
+        if (g_use_gpu && g_settings.net_host[0] && g_settings.net_pairing_code[0]) {
+            g_settings.net_upscale = !g_settings.net_upscale;
+            if (g_settings.net_upscale) {
+                if (!g_net_initialized) {
+                    g_net_initialized = net_upscale_init(g_settings.net_host, g_settings.net_pairing_code);
+                }
+                if (g_settings.ai_upscale) {
+                    g_settings.ai_upscale = false;
+                    gpu_video_set_ai_upscale(false);
+                }
+            }
+            gpu_video_set_network_upscale(g_settings.net_upscale && g_net_initialized);
         }
     }
     settings_save(&g_settings);
@@ -521,7 +612,7 @@ static void draw_menu(u32 *fb, u32 stride) {
     ty += lh + 10;
 
     for (int i = 0; i < count; i++) {
-        char line[48];
+        char line[96];  // wide enough for a 16-char padded label + a 63-char host string
         if (g_menu_level == 0) {
             const char *m[] = {"Resume", "Save", "Load", "Reset", "Settings", "Exit"};
             snprintf(line, sizeof(line), "%s", m[i]);
@@ -540,12 +631,20 @@ static void draw_menu(u32 *fb, u32 stride) {
                                        g_settings.overclock_boost_frames);
             else if (i == 6) snprintf(line, sizeof(line), "%-16s %s", "CRT Mode",
                                        g_settings.crt_mode ? "On" : "Off");
-            else if (!g_use_gpu) snprintf(line, sizeof(line), "%-16s %s", "AI Upscale",
+            else if (i == 7 && !g_use_gpu) snprintf(line, sizeof(line), "%-16s %s", "AI Upscale",
                                             "N/A (needs GPU accel)");
-            else if (!gpu_video_ai_upscale_available()) snprintf(line, sizeof(line), "%-16s %s",
+            else if (i == 7 && !gpu_video_ai_upscale_available()) snprintf(line, sizeof(line), "%-16s %s",
                                             "AI Upscale", "N/A (no weights)");
-            else snprintf(line, sizeof(line), "%-16s %s", "AI Upscale",
+            else if (i == 7) snprintf(line, sizeof(line), "%-16s %s", "AI Upscale",
                           g_settings.ai_upscale ? "On" : "Off");
+            else if (i == 8) snprintf(line, sizeof(line), "%-16s %.20s", "Network Setup",
+                          g_settings.net_host[0] ? g_settings.net_host : "(not configured)");
+            else if (i == 9 && !g_use_gpu) snprintf(line, sizeof(line), "%-16s %s",
+                                            "Network Upscale", "N/A (needs GPU accel)");
+            else if (i == 9 && (!g_settings.net_host[0] || !g_settings.net_pairing_code[0]))
+                snprintf(line, sizeof(line), "%-16s %s", "Network Upscale", "N/A (run Network Setup)");
+            else snprintf(line, sizeof(line), "%-16s %s", "Network Upscale",
+                          g_settings.net_upscale ? (net_upscale_connected() ? "On" : "On (connecting)") : "Off");
         } else {
             char ext[16];
             const char *name;
@@ -673,6 +772,12 @@ static void present(void) {
             } else {
                 gpu_video_set_hud(NULL, 0, 0);
             }
+        }
+        if (g_settings.net_upscale && g_net_initialized) {
+            const uint8_t *result_luma;
+            unsigned rw, rh;
+            if (net_upscale_get_result(&result_luma, &rw, &rh))
+                gpu_video_upload_network_result(result_luma, rw, rh);
         }
         bool ai_ran = gpu_video_ai_upscale_active();
         gpu_video_present();
@@ -823,6 +928,8 @@ int main(int argc, char **argv) {
     save_io_flush();        // these two must actually land before we exit
     retro_unload_game();
 cleanup:
+    if (g_net_initialized) net_upscale_exit();
+    free(g_luma_buf);
     save_io_exit();
     audio_exit();
     retro_deinit();

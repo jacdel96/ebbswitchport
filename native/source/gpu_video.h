@@ -63,6 +63,20 @@ unsigned gpu_video_get_ai_upscale_us(void);  // last dispatch's wall-clock cost,
 // inert instead of silently doing nothing.
 bool gpu_video_ai_upscale_available(void);
 
+// Experimental: network AI upscale (see net_upscale.h) — an alternative
+// source for the exact same output slot the local GPU ESPCN path fills.
+// Mutually exclusive with gpu_video_set_ai_upscale: the caller (main.c)
+// must not enable both at once. gpu_video_upload_network_result()
+// recombines the given upscaled luma plane with the ORIGINAL small game
+// frame's color (already resident from the last gpu_video_upload_frame
+// call this tick) into RGB on the CPU, then uploads it — w/h must equal
+// the current game resolution scaled by ESPCN's fixed x3 factor exactly,
+// or the call is dropped (a stale response for a since-changed resolution
+// is not safe to recombine against the current frame).
+void gpu_video_set_network_upscale(bool enabled);
+void gpu_video_upload_network_result(const uint8_t *luma, unsigned w, unsigned h);
+bool gpu_video_network_upscale_active(void);
+
 // Uploads whatever changed since the last call, draws, and presents. Call once
 // per main-loop iteration, whether or not a new game frame arrived that tick
 // (mirrors the CPU path's present(), which redraws the last frame every tick).
