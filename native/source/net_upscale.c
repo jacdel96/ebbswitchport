@@ -55,6 +55,67 @@ static char g_pairing_code[MAX_CODE_LEN];
 static uint8_t g_send_luma[MAX_W * MAX_H];
 static unsigned g_send_w = 0, g_send_h = 0;
 static bool g_send_pending = false;
+static uint64_t g_pending_hash = 0;  // hash of g_send_luma, carried alongside it so
+                                     // the network thread can cache the eventual
+                                     // result under the same key it was requested with
+
+// Small result cache, keyed by content hash — catches frames that are
+// pixel-identical to a recent one even when the SNES core doesn't flag them
+// as a dupe (that flag only means "core skipped rendering entirely"; a
+// static scene, paused animation, or idle loop still renders "new" frames
+// that are byte-for-byte the same). A cache hit skips the network call
+// entirely, not just the model compute.
+#define CACHE_SLOTS 3
+#define CACHE_TTL_NS (5ULL * 1000000000ULL)  // 5 seconds
+typedef struct {
+    bool valid;
+    uint64_t hash;
+    unsigned in_w, in_h;    // input (request) dims — the lookup key, alongside hash
+    unsigned out_w, out_h;  // whatever the server actually reported for this input;
+                             // not assumed to be a fixed multiple of in_w/in_h
+    uint64_t timestamp_ns;  // armTicksToNs(armGetSystemTick()) at insertion
+    uint8_t luma[MAX_OUT_W * MAX_OUT_H];
+} CacheEntry;
+static CacheEntry g_cache[CACHE_SLOTS];
+static int g_cache_next_slot = 0;  // round-robin eviction — simplest option that
+                                    // doesn't need per-entry access tracking
+
+// FNV-1a, 64-bit — fast, non-cryptographic, plenty for "is this the same
+// frame we already have a result for" (not a security boundary; the actual
+// wire protocol's authentication is the AEAD handshake in do_handshake).
+static uint64_t fnv1a(const uint8_t *data, size_t len) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < len; i++) {
+        h ^= data[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+// Must be called with g_lock held. Returns the matching slot index, or -1.
+static int cache_find(uint64_t hash, unsigned in_w, unsigned in_h) {
+    uint64_t now_ns = armTicksToNs(armGetSystemTick());
+    for (int i = 0; i < CACHE_SLOTS; i++) {
+        if (!g_cache[i].valid) continue;
+        if (g_cache[i].hash != hash || g_cache[i].in_w != in_w || g_cache[i].in_h != in_h) continue;
+        if (now_ns - g_cache[i].timestamp_ns > CACHE_TTL_NS) continue;
+        return i;
+    }
+    return -1;
+}
+
+// Must be called with g_lock held.
+static void cache_insert(uint64_t hash, unsigned in_w, unsigned in_h,
+                          unsigned out_w, unsigned out_h, const uint8_t *luma) {
+    int slot = g_cache_next_slot;
+    g_cache_next_slot = (g_cache_next_slot + 1) % CACHE_SLOTS;
+    g_cache[slot].valid = true;
+    g_cache[slot].hash = hash;
+    g_cache[slot].in_w = in_w; g_cache[slot].in_h = in_h;
+    g_cache[slot].out_w = out_w; g_cache[slot].out_h = out_h;
+    g_cache[slot].timestamp_ns = armTicksToNs(armGetSystemTick());
+    memcpy(g_cache[slot].luma, luma, (size_t)out_w * out_h);
+}
 
 // Latest inbound result (mutex-guarded). Double-buffered isn't needed since
 // the caller copies out (or reads) while holding no lock across frames —
@@ -279,6 +340,7 @@ static void net_thread_func(void *arg) {
             mutexLock(&g_lock);
             bool have_send = g_send_pending;
             unsigned sw = g_send_w, sh = g_send_h;
+            uint64_t pending_hash = g_pending_hash;
             if (have_send) memcpy(s_send_copy, g_send_luma, (size_t)sw * sh);
             g_send_pending = false;
             mutexUnlock(&g_lock);
@@ -323,6 +385,7 @@ static void net_thread_func(void *arg) {
             g_result_w = ow; g_result_h = oh;
             g_have_result = true;
             g_result_generation++;
+            cache_insert(pending_hash, sw, sh, ow, oh, s_decompressed);
             mutexUnlock(&g_lock);
         }
 
@@ -371,9 +434,27 @@ bool net_upscale_init(const char *host_port, const char *pairing_code) {
 
 void net_upscale_submit_frame(const uint8_t *luma, unsigned w, unsigned h) {
     if (!g_ready || w == 0 || h == 0 || w > MAX_W || h > MAX_H) return;
+    uint64_t hash = fnv1a(luma, (size_t)w * h);
+
     mutexLock(&g_lock);
+    int slot = cache_find(hash, w, h);
+    if (slot >= 0) {
+        // Same content as a recent frame (the SNES core's own dupe flag only
+        // catches "skipped rendering entirely" — this also catches a static
+        // scene/paused animation/idle loop that still renders "new" frames
+        // byte-for-byte identical to a previous one) — skip the network
+        // call entirely and serve the cached result directly.
+        memcpy(g_result_luma, g_cache[slot].luma, (size_t)g_cache[slot].out_w * g_cache[slot].out_h);
+        g_result_w = g_cache[slot].out_w;
+        g_result_h = g_cache[slot].out_h;
+        g_have_result = true;
+        g_result_generation++;
+        mutexUnlock(&g_lock);
+        return;
+    }
     memcpy(g_send_luma, luma, (size_t)w * h);
     g_send_w = w; g_send_h = h;
+    g_pending_hash = hash;
     g_send_pending = true;
     mutexUnlock(&g_lock);
 }
