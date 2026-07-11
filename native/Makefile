@@ -53,10 +53,12 @@ LDFLAGS  = -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $
 # default since the GPU path hasn't run on real hardware yet; flip to 0 once
 # it's verified working, to switch to the release lib.
 DEKO3D_DEBUG ?= 1
-# mbedtls{,x509,crypto} (switch-mbedtls portlib) — ChaCha20-Poly1305/HKDF/HMAC
-# for the experimental network AI-upscale offload (net_upscale.c). zstd
-# (switch-libzstd portlib) — response decompression, faster than zlib on
-# both compress and decompress for this data (see net_upscale_server.py).
+# mbedtls{,x509,crypto} (switch-mbedtls portlib) — HKDF/HMAC for the network
+# AI-upscale pairing handshake (net_upscale.c; protocol v2 dropped per-frame
+# ChaCha20 sealing — see net_upscale.h's security note). zstd
+# (switch-libzstd portlib) — both compress (request diffs) and decompress
+# (responses); the whole diff+zstd pipeline is a runtime toggle
+# (Settings > Network Compression), negotiated per session.
 # Link order matters: mbedtls depends on mbedx509, which depends on mbedcrypto.
 ifeq ($(DEKO3D_DEBUG),1)
 LIBS := -ldeko3dd -lsnes9x_libretro_libnx -lmbedtls -lmbedx509 -lmbedcrypto -lzstd -lstdc++ -lnx -lm

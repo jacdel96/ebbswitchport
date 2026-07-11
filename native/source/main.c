@@ -54,9 +54,9 @@ static u32 *g_frame = NULL;
 #define SLOT_COUNT 10            // manual slots 0..9
 #define LOAD_COUNT (SLOT_COUNT + 2)  // + auto1 + auto10
 #define MAIN_COUNT 6             // Resume/Save/Load/Reset/Settings/Exit
-#define SETTINGS_COUNT 10        // Hardware Accel/Audio Buffer/Show HUD/Dynamic Overclock/
+#define SETTINGS_COUNT 11        // Hardware Accel/Audio Buffer/Show HUD/Dynamic Overclock/
                                   // OC Trigger/OC Boost/CRT Mode/AI Upscale/
-                                  // Network Setup/Network Upscale
+                                  // Network Setup/Network Upscale/Network Compression
 static bool g_menu_open = false;
 static int g_menu_level = 0;
 static int g_menu_sel = 0;
@@ -272,7 +272,20 @@ static void video_refresh(const void *data, unsigned width, unsigned height,
                     float y = 0.299f * r + 0.587f * g + 0.114f * b;
                     g_luma_buf[i] = (uint8_t)(y < 0.0f ? 0.0f : (y > 255.0f ? 255.0f : y));
                 }
-                net_upscale_submit_frame(g_luma_buf, width, height);
+                // Blocks retro_run() itself (this is called synchronously
+                // from inside it) on this frame's own upscaled result,
+                // rather than treating the network round trip as background
+                // work the game never waits for — Network Upscale is on, so
+                // every displayed frame should show ITS OWN result, not
+                // whatever previous round trip happened to land most
+                // recently. Bounded at 60ms (~2x the ~26ms measured wired
+                // round trip, room for jitter without stalling gameplay for
+                // anywhere near secure_recv's much longer 500ms socket-level
+                // budget) — on timeout this just fails soft like everything
+                // else here: present() keeps showing the last successful
+                // result via its own net_upscale_get_result() poll, nothing
+                // hangs or crashes.
+                net_upscale_submit_and_wait(g_luma_buf, width, height, 60, NULL, NULL, NULL);
             }
         }
         return;
@@ -600,7 +613,8 @@ static void settings_adjust(int sel, int dir) {
             g_settings.net_upscale = !g_settings.net_upscale;
             if (g_settings.net_upscale) {
                 if (!g_net_initialized) {
-                    g_net_initialized = net_upscale_init(g_settings.net_host, g_settings.net_pairing_code);
+                    g_net_initialized = net_upscale_init(g_settings.net_host, g_settings.net_pairing_code,
+                                                          g_settings.net_compression);
                 }
                 if (g_settings.ai_upscale) {
                     g_settings.ai_upscale = false;
@@ -609,6 +623,14 @@ static void settings_adjust(int sel, int dir) {
             }
             gpu_video_set_network_upscale(g_settings.net_upscale && g_net_initialized);
         }
+    } else if (sel == 10) {
+        // net_upscale_set_compression, not net_upscale_init: init only runs
+        // once per session (see sel==9's !g_net_initialized guard). The
+        // setter force-reconnects a live session whose negotiated value
+        // differs, so this toggle takes real effect within ~1s — see
+        // net_upscale.h for why anything less reliable half-applies.
+        g_settings.net_compression = !g_settings.net_compression;
+        if (g_net_initialized) net_upscale_set_compression(g_settings.net_compression);
     }
     settings_save(&g_settings);
 }
@@ -666,8 +688,10 @@ static void draw_menu(u32 *fb, u32 stride) {
                                             "Network Upscale", "N/A (needs GPU accel)");
             else if (i == 9 && (!g_settings.net_host[0] || !g_settings.net_pairing_code[0]))
                 snprintf(line, sizeof(line), "%-16s %s", "Network Upscale", "N/A (run Network Setup)");
-            else snprintf(line, sizeof(line), "%-16s %s", "Network Upscale",
+            else if (i == 9) snprintf(line, sizeof(line), "%-16s %s", "Network Upscale",
                           g_settings.net_upscale ? (net_upscale_connected() ? "On" : "On (connecting)") : "Off");
+            else if (i == 10) snprintf(line, sizeof(line), "%-16s %s", "Net Compression",
+                          g_settings.net_compression ? "On" : "Off");
         } else {
             char ext[16];
             const char *name;

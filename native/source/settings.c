@@ -25,6 +25,7 @@ void settings_load(Settings *out) {
     out->net_host[0] = '\0';
     out->net_pairing_code[0] = '\0';
     out->net_upscale = false;  // never persisted, same reasoning as ai_upscale above
+    out->net_compression = false;
 
     FILE *f = fopen(SETTINGS_PATH, "rb");
     if (!f) return;
@@ -41,6 +42,7 @@ void settings_load(Settings *out) {
         else if (sscanf(line, "crt_mode=%d", &v) == 1) out->crt_mode = v != 0;
         else if (sscanf(line, "net_host=%63[^\n]", sval) == 1) snprintf(out->net_host, sizeof(out->net_host), "%s", sval);
         else if (sscanf(line, "net_pairing_code=%63[^\n]", sval) == 1) snprintf(out->net_pairing_code, sizeof(out->net_pairing_code), "%s", sval);
+        else if (sscanf(line, "net_compression=%d", &v) == 1) out->net_compression = v != 0;
         // ai_upscale/net_upscale intentionally not read back — always start false.
     }
     fclose(f);
@@ -54,10 +56,10 @@ void settings_save(const Settings *s) {
     // ai_upscale/net_upscale intentionally not written — never persisted, see settings_load.
     fprintf(f, "hw_accel=%d\naudio_buffer_ms=%u\nshow_hud=%d\ndynamic_overclock=%d\n"
                "overclock_trigger_dupes=%u\noverclock_boost_frames=%u\ncrt_mode=%d\n"
-               "net_host=%s\nnet_pairing_code=%s\n",
+               "net_host=%s\nnet_pairing_code=%s\nnet_compression=%d\n",
             s->hw_accel ? 1 : 0, s->audio_buffer_ms, s->show_hud ? 1 : 0,
             s->dynamic_overclock ? 1 : 0, s->overclock_trigger_dupes, s->overclock_boost_frames,
-            s->crt_mode ? 1 : 0, s->net_host, s->net_pairing_code);
+            s->crt_mode ? 1 : 0, s->net_host, s->net_pairing_code, s->net_compression ? 1 : 0);
     fclose(f);
     remove(SETTINGS_PATH);
     rename(SETTINGS_TMP, SETTINGS_PATH);

@@ -27,6 +27,15 @@ typedef struct {
                                 // of the local GPU (see net_upscale.h); mutually exclusive
                                 // with ai_upscale — enabling one clears the other; never
                                 // persisted, same reasoning as ai_upscale
+    bool     net_compression;  // whether the network-upscale response gets zstd-compressed;
+                                // negotiated once per connection right after the pairing
+                                // handshake (see net_upscale.h) — persisted, since it's a
+                                // link preference like net_host, not a live session toggle.
+                                // Worth it on WiFi (smaller/faster than the ~2ms compress
+                                // cost saves in transit time); not worth it on a wired
+                                // gigabit link (see net_upscale_server.py's comment) —
+                                // default off, since this project's primary tested setup
+                                // is now the direct wired link.
 } Settings;
 
 // Fills *out with defaults, then overrides from sdmc:/switch/ebbswitchport/settings.cfg
