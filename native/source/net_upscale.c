@@ -32,8 +32,16 @@ static const uint8_t NET_MAGIC[4] = { 'E', 'B', 'U', '2' };
 #define FLAG_DIFF     2  // payload (after decompression) is XOR vs frame ref_id
 #define FLAG_NEED_KEY 4  // requests only: reply to this frame with a keyframe
 #define FLAG_NACK     8  // responses only: request diff undecodable server-side
+#define FLAG_MC       16 // responses only: the diff was taken against the
+                          // reference SHIFTED by (mc_dx, mc_dy) output-space
+                          // pixels, zero-filled at the revealed edges — motion
+                          // compensation for camera scroll, which otherwise
+                          // makes XOR diffs dense exactly when frames are most
+                          // frequent. The server estimates the shift; this
+                          // side only has to rebuild the shifted reference.
+#define MC_MAX_SHIFT  96 // output-space bound (3x the server's 32px input bound)
 
-#define FRAME_HDR_LEN 46
+#define FRAME_HDR_LEN 50
 #define REQ_CHUNK 61440   // request chunk payload — a real 256x224 frame (57KB)
                            // fits in ONE datagram (bench-verified: ~40 IP
                            // fragments, 0/100 lost on the direct link)
@@ -223,6 +231,7 @@ typedef struct {
     uint8_t flags;
     unsigned out_w, out_h;
     uint32_t total_len, uncomp_len, ref_id, peer_id;
+    int mc_dx, mc_dy;
     unsigned chunk_count, received;
     uint8_t have[MAX_CHUNKS / 8];
 } Reasm;
@@ -256,6 +265,7 @@ typedef struct {
     unsigned chunk_idx, chunk_count;
     unsigned w, h;
     uint32_t frame_id, total_len, uncomp_len, offset, ref_id, peer_id;
+    int mc_dx, mc_dy;
     uint64_t token;
 } FrameHdr;
 
@@ -273,7 +283,9 @@ static void frame_hdr_write(uint8_t *p, const FrameHdr *fh) {
     put_u32(p + 26, fh->offset);
     put_u32(p + 30, fh->ref_id);
     put_u32(p + 34, fh->peer_id);
-    put_u64(p + 38, fh->token);
+    put_u16(p + 38, (uint16_t)(int16_t)fh->mc_dx);
+    put_u16(p + 40, (uint16_t)(int16_t)fh->mc_dy);
+    put_u64(p + 42, fh->token);
 }
 
 static bool frame_hdr_read(const uint8_t *p, int n, FrameHdr *fh) {
@@ -290,7 +302,9 @@ static bool frame_hdr_read(const uint8_t *p, int n, FrameHdr *fh) {
     fh->offset = get_u32(p + 26);
     fh->ref_id = get_u32(p + 30);
     fh->peer_id = get_u32(p + 34);
-    fh->token = get_u64(p + 38);
+    fh->mc_dx = (int16_t)get_u16(p + 38);
+    fh->mc_dy = (int16_t)get_u16(p + 40);
+    fh->token = get_u64(p + 42);
     return true;
 }
 
@@ -318,6 +332,7 @@ static bool send_dgram_retry(int sock, const uint8_t *buf, size_t len) {
 
 // XOR of two equal-size buffers into dst, u64-wide with a byte tail —
 // a byte-wise loop over 516KB costs real milliseconds on this CPU.
+// dst may alias a (in-place XOR): each index is read before it's written.
 static void xor_buffers(uint8_t *dst, const uint8_t *a, const uint8_t *b, size_t n) {
     size_t words = n / 8;
     uint64_t *d64 = (uint64_t *)dst;
@@ -325,6 +340,28 @@ static void xor_buffers(uint8_t *dst, const uint8_t *a, const uint8_t *b, size_t
     const uint64_t *b64 = (const uint64_t *)b;
     for (size_t i = 0; i < words; i++) d64[i] = a64[i] ^ b64[i];
     for (size_t i = words * 8; i < n; i++) dst[i] = a[i] ^ b[i];
+}
+
+// dst = ref shifted by (dx, dy) with zero fill at the revealed edges —
+// shifted(y, x) = ref(y - dy, x - dx). Row-wise memcpy/memset, so it costs
+// about one 516KB copy (~0.2ms), same as the unshifted path's memcpy.
+static void build_shifted(uint8_t *dst, const uint8_t *ref,
+                           unsigned ow, unsigned oh, int dx, int dy) {
+    unsigned copy_w = (unsigned)((int)ow - (dx < 0 ? -dx : dx));
+    unsigned dst_x = (unsigned)(dx > 0 ? dx : 0);
+    unsigned src_x = (unsigned)(dx < 0 ? -dx : 0);
+    for (int y = 0; y < (int)oh; y++) {
+        uint8_t *drow = dst + (size_t)y * ow;
+        int sy = y - dy;
+        if (sy < 0 || sy >= (int)oh) {
+            memset(drow, 0, ow);
+            continue;
+        }
+        const uint8_t *srow = ref + (size_t)sy * ow;
+        if (dst_x) memset(drow, 0, dst_x);
+        memcpy(drow + dst_x, srow + src_x, copy_w);
+        if (dst_x + copy_w < ow) memset(drow + dst_x + copy_w, 0, ow - dst_x - copy_w);
+    }
 }
 
 // HKDF(SHA-256, salt, ikm, info) -> 32 bytes. Mirrors
@@ -489,6 +526,9 @@ static void reader_thread_func(void *arg) {
         if (fh.total_len == 0 || fh.total_len > RESP_MAX) continue;
         if (!(fh.flags & FLAG_COMP) && fh.total_len != fh.uncomp_len) continue;
         if ((fh.flags & FLAG_DIFF) && (!(fh.flags & FLAG_COMP) || fh.ref_id == 0)) continue;
+        if ((fh.flags & FLAG_MC) && !(fh.flags & FLAG_DIFF)) continue;
+        if (fh.mc_dx < -MC_MAX_SHIFT || fh.mc_dx > MC_MAX_SHIFT ||
+            fh.mc_dy < -MC_MAX_SHIFT || fh.mc_dy > MC_MAX_SHIFT) continue;
         if (fh.chunk_count == 0 || fh.chunk_count > MAX_CHUNKS || fh.chunk_idx >= fh.chunk_count) continue;
         if (fh.offset > fh.total_len || part_len > fh.total_len - fh.offset) continue;
 
@@ -511,6 +551,8 @@ static void reader_thread_func(void *arg) {
             rs->uncomp_len = fh.uncomp_len;
             rs->ref_id = fh.ref_id;
             rs->peer_id = fh.peer_id;
+            rs->mc_dx = fh.mc_dx;
+            rs->mc_dy = fh.mc_dy;
             rs->chunk_count = fh.chunk_count;
         } else if (rs->total_len != fh.total_len || rs->chunk_count != fh.chunk_count ||
                    rs->out_w != fh.w || rs->out_h != fh.h || rs->flags != fh.flags) {
@@ -565,7 +607,13 @@ static void reader_thread_func(void *arg) {
             if (i == ref_slot) continue;
             if (dst < 0 || s_out_ring_id[i] < s_out_ring_id[dst]) dst = i;
         }
-        if (rs->flags & FLAG_DIFF) {
+        if ((rs->flags & FLAG_MC) && (rs->mc_dx || rs->mc_dy)) {
+            // Motion-compensated diff: rebuild the shifted reference the
+            // server diffed against, then XOR the diff plane in place.
+            build_shifted(s_out_ring[dst], s_out_ring[ref_slot], ow, oh,
+                          rs->mc_dx, rs->mc_dy);
+            xor_buffers(s_out_ring[dst], s_out_ring[dst], plane, out_len);
+        } else if (rs->flags & FLAG_DIFF) {
             xor_buffers(s_out_ring[dst], s_out_ring[ref_slot], plane, out_len);
         } else {
             memcpy(s_out_ring[dst], plane, out_len);

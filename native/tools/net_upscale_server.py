@@ -87,13 +87,20 @@ T_FRAME_REQ, T_FRAME_RESP = 0x10, 0x11
 CHALLENGE_LEN = 16
 HMAC_LEN = 32
 
-FRAME_HDR = struct.Struct("<4sBBHHHHIIIIIIQ")
-# (magic, type, flags, chunk_idx, chunk_count, w, h,
-#  frame_id, total_len, uncomp_len, offset, ref_id, peer_id, token) = 46 bytes
+FRAME_HDR = struct.Struct("<4sBBHHHHIIIIIIhhQ")
+# (magic, type, flags, chunk_idx, chunk_count, w, h, frame_id, total_len,
+#  uncomp_len, offset, ref_id, peer_id, mc_dx, mc_dy, token) = 50 bytes
 FLAG_COMP = 1
 FLAG_DIFF = 2
 FLAG_NEED_KEY = 4
 FLAG_NACK = 8
+FLAG_MC = 16   # responses only: the diff was taken against the reference
+               # SHIFTED by (mc_dx, mc_dy) output-space pixels (zero-filled
+               # at the revealed edges) — motion compensation for camera
+               # scroll, which otherwise makes XOR diffs dense exactly when
+               # frames are most frequent
+
+MC_MAX_INPUT_SHIFT = 32   # input-space search bound; scrolls are a few px/frame
 
 RESP_CHUNK = 16384   # response chunk payload size — bench showed identical
                       # throughput to 60KB chunks, and smaller chunks put less
@@ -294,6 +301,51 @@ def gpu_worker(model, device):
         _gpu_queue.task_done()
 
 
+def estimate_shift(ref_img, cur_img, max_shift=MC_MAX_INPUT_SHIFT):
+    """Global-translation estimate between two same-shape uint8 planes, via
+    phase correlation (FFT of the normalized cross-power spectrum — the
+    standard trick; sub-ms in numpy at 256x224). Returns (dx, dy) meaning
+    cur(y, x) ~= ref(y - dy, x - dx), or (0, 0) when there's no shift worth
+    using. A sampled SAD check guards against garbage peaks on scene cuts:
+    the shift must actually explain the frame change much better than no
+    shift, or we fall back to the plain diff."""
+    a = ref_img.astype(np.float32)
+    b = cur_img.astype(np.float32)
+    fa = np.fft.rfft2(a)
+    fb = np.fft.rfft2(b)
+    cross = fb * np.conj(fa)
+    mag = np.abs(cross)
+    mag[mag < 1e-9] = 1e-9
+    corr = np.fft.irfft2(cross / mag, s=a.shape)
+    dy, dx = np.unravel_index(np.argmax(corr), corr.shape)
+    if dy > a.shape[0] // 2:
+        dy -= a.shape[0]
+    if dx > a.shape[1] // 2:
+        dx -= a.shape[1]
+    if (dx == 0 and dy == 0) or abs(dx) > max_shift or abs(dy) > max_shift:
+        return 0, 0
+    # Sampled verification, margins > max_shift so np.roll's wrapped strips
+    # never pollute the samples.
+    m = max_shift * 2
+    ys, xs = slice(m, a.shape[0] - m, 7), slice(m, a.shape[1] - m, 7)
+    cur_s = b[ys, xs]
+    sad_shift = np.abs(cur_s - np.roll(a, (dy, dx), axis=(0, 1))[ys, xs]).mean()
+    sad_plain = np.abs(cur_s - a[ys, xs]).mean()
+    if sad_shift * 2.0 > sad_plain:
+        return 0, 0
+    return int(dx), int(dy)
+
+
+def shifted_plane(ref_flat, oh, ow, dy, dx):
+    """ref shifted by (dy, dx) with zero fill at the revealed edges —
+    shifted(y, x) = ref(y - dy, x - dx)."""
+    ref = ref_flat.reshape(oh, ow)
+    out = np.zeros_like(ref)
+    out[max(0, dy):oh - max(0, -dy), max(0, dx):ow - max(0, -dx)] = \
+        ref[max(0, -dy):oh - max(0, dy), max(0, -dx):ow - max(0, dx)]
+    return out.reshape(-1)
+
+
 def make_session(addr, token, compression):
     return {
         "addr": addr,
@@ -327,14 +379,15 @@ def ring_put(ring, key, value):
 
 
 def send_chunked(sock, addr, frame_type, flags, w, h, frame_id,
-                 payload, uncomp_len, ref_id, peer_id, token):
+                 payload, uncomp_len, ref_id, peer_id, token, mc_dx=0, mc_dy=0):
     total = len(payload)
     count = max(1, (total + RESP_CHUNK - 1) // RESP_CHUNK)
     off = 0
     for i in range(count):
         part = payload[off:off + RESP_CHUNK]
         hdr = FRAME_HDR.pack(NET_MAGIC, frame_type, flags, i, count, w, h,
-                             frame_id, total, uncomp_len, off, ref_id, peer_id, token)
+                             frame_id, total, uncomp_len, off, ref_id, peer_id,
+                             mc_dx, mc_dy, token)
         sock.sendto(hdr + part, addr)
         off += len(part)
 
@@ -359,6 +412,7 @@ def responder(sock, sessions):
 
         flags = 0
         ref_id = 0
+        mc_dx = mc_dy = 0
         payload = out_bytes
         if meta["compression"]:
             held = meta["held_output_id"]
@@ -367,21 +421,47 @@ def responder(sock, sessions):
                 # Diff against exactly what the client declared holding —
                 # never just "the previous frame", so a lost response can
                 # only make the next diff a bit bigger, never corrupt it.
+                #
+                # Motion compensation first: camera scroll makes plain XOR
+                # diffs dense exactly when frames are most frequent. Estimate
+                # the global shift on the INPUT pair (cheap at 256x224),
+                # apply it x3 to the output reference, zero-filled — the
+                # diff collapses back to the revealed strip + sprites.
                 diff = np.bitwise_xor(out_flat, ref[0])
+                in_cur = sess["inputs"].get(meta["frame_id"])
+                in_ref = sess["inputs"].get(held)
+                if (in_cur is not None and in_ref is not None
+                        and in_cur[1] == in_ref[1] and in_cur[2] == in_ref[2]):
+                    idx, idy = estimate_shift(
+                        in_ref[0].reshape(in_ref[2], in_ref[1]),
+                        in_cur[0].reshape(in_cur[2], in_cur[1]))
+                    if idx or idy:
+                        # Final arbiter is sampled XOR density — the actual
+                        # thing compressed size tracks — not the SAD gate
+                        # alone: parallax layers scrolling at different rates
+                        # can pass the shift sanity check while the shifted
+                        # diff ends up no sparser than the plain one.
+                        shifted = shifted_plane(ref[0], out_h, out_w, idy * 3, idx * 3)
+                        mc_diff = np.bitwise_xor(out_flat, shifted)
+                        if (np.count_nonzero(mc_diff[::64])
+                                < np.count_nonzero(diff[::64])):
+                            diff = mc_diff
+                            mc_dx, mc_dy = idx * 3, idy * 3
+                            flags |= FLAG_MC
                 payload = zc.compress(diff.tobytes())
-                flags = FLAG_COMP | FLAG_DIFF
+                flags |= FLAG_COMP | FLAG_DIFF
                 ref_id = held
             else:
                 payload = zc.compress(out_bytes)
                 flags = FLAG_COMP
             if len(payload) >= uncomp_len:
                 # zstd expanded it (adversarial content) — raw is strictly better
-                payload, flags, ref_id = out_bytes, 0, 0
+                payload, flags, ref_id, mc_dx, mc_dy = out_bytes, 0, 0, 0, 0
         t_comp = time.perf_counter()
 
         send_chunked(sock, meta["addr"], T_FRAME_RESP, flags, out_w, out_h,
                      meta["frame_id"], payload, uncomp_len, ref_id,
-                     sess["latest_input_id"], sess["token"])
+                     sess["latest_input_id"], sess["token"], mc_dx, mc_dy)
         t_send = time.perf_counter()
 
         # Response ring: store regardless of how this one was encoded — it's
@@ -402,6 +482,8 @@ def responder(sock, sessions):
             st["diff_frames"] += 1
         else:
             st["key_frames"] += 1
+        if flags & FLAG_MC:
+            st["mc_frames"] = st.get("mc_frames", 0) + 1
 
         if len(st["infer"]) >= STATS_WINDOW:
             n = len(st["infer"])
@@ -416,8 +498,10 @@ def responder(sock, sessions):
                   f"encode+send {sum(st['encode'])/n:.2f}ms, "
                   f"keepalive collisions {st['ka_collisions']}/{n}")
             print(f"[t] {sess['label']}: response avg {sum(st['resp_kb'])/n:.1f}KB "
-                  f"({st['diff_frames']} diff / {st['key_frames']} key), "
+                  f"({st['diff_frames']} diff / {st['key_frames']} key, "
+                  f"{st.get('mc_frames', 0)} motion-compensated), "
                   f"requests {st['req_diff_frames']} diff / {st['req_raw_frames']} raw")
+            st["mc_frames"] = 0
             st["decode"].clear()
             st["qwait"].clear()
             st["gpu"].clear()
@@ -452,7 +536,7 @@ def handle_request_complete(sock, sess, frame_id, flags, w, h, buf, uncomp_len,
             # Can't decode — tell the client immediately so it falls back to
             # raw instead of waiting out a timeout. peer_id=0 resets its ACK.
             hdr = FRAME_HDR.pack(NET_MAGIC, T_FRAME_RESP, FLAG_NACK, 0, 1,
-                                 0, 0, frame_id, 0, 0, 0, 0, 0, sess["token"])
+                                 0, 0, frame_id, 0, 0, 0, 0, 0, 0, 0, sess["token"])
             sock.sendto(hdr, sess["addr"])
             print(f"[!] {sess['label']}: request diff vs missing input {ref_id} — NACKed")
             return
@@ -577,7 +661,7 @@ def main():
         elif mtype == T_FRAME_REQ and len(data) >= FRAME_HDR.size:
             try:
                 (_, _, flags, chunk_idx, chunk_count, w, h, frame_id,
-                 total_len, uncomp_len, offset, ref_id, peer_id, token) = \
+                 total_len, uncomp_len, offset, ref_id, peer_id, _, _, token) = \
                     FRAME_HDR.unpack_from(data)
             except struct.error:
                 continue
