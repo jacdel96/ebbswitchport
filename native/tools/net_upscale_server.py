@@ -133,7 +133,7 @@ class ESPCN(nn.Module):
         return self.shuffle(x)
 
 
-def load_weights(model, bin_path):
+def read_weight_arrays(bin_path):
     """Loads native/tools/package_weights.py's binary format directly —
     struct/numpy only, no torch.load/pickle involved for this file."""
     with open(bin_path, "rb") as f:
@@ -159,7 +159,11 @@ def load_weights(model, bin_path):
         trailing = f.read()
         if trailing:
             raise ValueError(f"{len(trailing)} unexpected trailing bytes")
+    return w1, b1, w2, b2, w3, b3
 
+
+def load_weights(model, bin_path):
+    w1, b1, w2, b2, w3, b3 = read_weight_arrays(bin_path)
     # Assigning straight from torch.from_numpy() would silently reset these
     # parameters to CPU tensors even if the model was already .to(device)'d
     # (a real bug hit while testing this) — move each one explicitly.
@@ -170,6 +174,188 @@ def load_weights(model, bin_path):
     model.conv2.bias.data = torch.from_numpy(b2).to(device)
     model.conv3.weight.data = torch.from_numpy(w3).to(device)
     model.conv3.bias.data = torch.from_numpy(b3).to(device)
+
+
+# ---- inference backends -------------------------------------------------------
+# Two implementations of the same contract:
+#   .name             human-readable, for the startup log
+#   .wants_keepalive  whether the idle-GPU wake-up tax applies (see gpu_worker)
+#   .infer(luma, h, w) -> np.uint8 array shaped (1, 1, 3h, 3w)
+#   .keepalive(shape) run a dummy inference at (h, w) to keep the GPU warm
+#
+# MPSGraph-direct is the default where available: same Apple conv kernels
+# PyTorch/MPS uses underneath, but precompiled to a fixed-shape executable
+# with preallocated zero-copy MTLBuffers — measured 3.7ms/frame vs PyTorch
+# eager's 5.5ms (the ~2ms delta is pure framework dispatch, not compute).
+# Output was verified bit-exact against the PyTorch reference (max 1 LSB).
+
+
+class TorchInference:
+    def __init__(self, weights_path):
+        self.device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+        self.model = ESPCN().to(self.device).eval()
+        load_weights(self.model, weights_path)
+        self.bufs = {}   # (h, w) -> persistent GPU input tensor (worker-thread-only)
+        self.wants_keepalive = self.device.type == "mps"
+        self.name = f"torch-{self.device.type}"
+
+    def infer(self, luma, h, w):
+        cpu_view = torch.from_numpy(luma.reshape(1, 1, h, w).astype(np.float32) / 255.0)
+        buf = self.bufs.get((h, w))
+        if buf is None:
+            buf = torch.empty((1, 1, h, w), dtype=torch.float32, device=self.device)
+            self.bufs[(h, w)] = buf
+        with torch.no_grad():
+            buf.copy_(cpu_view)
+            y = self.model(buf)
+            if self.device.type == "mps":
+                torch.mps.synchronize()
+            return (y.clamp(0, 1) * 255.0).round().to(torch.uint8).cpu().numpy()
+
+    def keepalive(self, shape):
+        h, w = shape
+        buf = self.bufs.get(("ka", h, w))
+        if buf is None:
+            buf = torch.zeros((1, 1, h, w), dtype=torch.float32, device=self.device)
+            self.bufs[("ka", h, w)] = buf
+        with torch.no_grad():
+            _ = self.model(buf)
+            if self.device.type == "mps":
+                torch.mps.synchronize()
+
+
+class MPSGraphInference:
+    _MPS_F32 = 0x10000000 | 32
+
+    def __init__(self, weights_path):
+        # Imports live here so machines without pyobjc (or without Metal)
+        # cleanly fall back to TorchInference via make_inference_backend.
+        import Metal
+        import MetalPerformanceShadersGraph as G
+        from Foundation import NSData, NSNumber, NSArray
+        self._G, self._NSData, self._NSNumber, self._NSArray = G, NSData, NSNumber, NSArray
+
+        self.weights = read_weight_arrays(weights_path)
+        self.device = Metal.MTLCreateSystemDefaultDevice()
+        if self.device is None:
+            raise RuntimeError("no Metal device")
+        self.queue = self.device.newCommandQueue()
+        self.gdev = G.MPSGraphDevice.deviceWithMTLDevice_(self.device)
+        self.cache = {}  # (h, w) -> dict(exe, in_buf, out_buf, in_td, out_td, sizes)
+        self.name = f"mpsgraph ({self.device.name()})"
+        self.wants_keepalive = True
+        # Warm the shapes we know we'll need: shape compilation costs ~0.5s
+        # a piece (measured), which must never land on a live frame.
+        self._entry(224, 256)
+        self._entry(8, 8)
+
+    def _shape(self, *dims):
+        return self._NSArray.arrayWithArray_(
+            [self._NSNumber.numberWithInt_(d) for d in dims])
+
+    def _entry(self, h, w):
+        e = self.cache.get((h, w))
+        if e is not None:
+            return e
+        G, NSData = self._G, self._NSData
+        w1, b1, w2, b2, w3, b3 = self.weights
+        graph = G.MPSGraph.alloc().init()
+        inp = graph.placeholderWithShape_dataType_name_(
+            self._shape(1, 1, h, w), self._MPS_F32, "input")
+
+        def const(np_arr, *dims):
+            arr = np.ascontiguousarray(np_arr, dtype=np.float32)
+            data = NSData.dataWithBytes_length_(arr.tobytes(), arr.nbytes)
+            return graph.constantWithData_shape_dataType_(
+                data, self._shape(*dims), self._MPS_F32)
+
+        def conv(x, wgt, bias, k, name):
+            oc, ic = wgt.shape[0], wgt.shape[1]
+            pad = k // 2
+            desc = G.MPSGraphConvolution2DOpDescriptor.descriptorWithStrideInX_strideInY_dilationRateInX_dilationRateInY_groups_paddingLeft_paddingRight_paddingTop_paddingBottom_paddingStyle_dataLayout_weightsLayout_(
+                1, 1, 1, 1, 1, pad, pad, pad, pad,
+                0,   # explicit padding
+                0,   # data layout NCHW
+                2)   # weights layout OIHW
+            y = graph.convolution2DWithSourceTensor_weightsTensor_descriptor_name_(
+                x, const(wgt, oc, ic, k, k), desc, name)
+            return graph.additionWithPrimaryTensor_secondaryTensor_name_(
+                y, const(bias.reshape(1, oc, 1, 1), 1, oc, 1, 1), name + "_b")
+
+        x = conv(inp, w1, b1, 5, "c1")
+        x = graph.tanhWithTensor_name_(x, "t1")
+        x = conv(x, w2, b2, 3, "c2")
+        x = graph.tanhWithTensor_name_(x, "t2")
+        x = conv(x, w3, b3, 3, "c3")
+        # PixelShuffle(3) == depthToSpace with pixel-shuffle ordering (NCHW).
+        x = graph.depthToSpace2DTensor_widthAxis_heightAxis_depthAxis_blockSize_usePixelShuffleOrder_name_(
+            x, 3, 2, 1, 3, True, "ps")
+        # Bake the postprocess (clamp/scale/round) into the graph so the CPU
+        # side is just a float->u8 cast.
+        zero = graph.constantWithScalar_dataType_(0.0, self._MPS_F32)
+        one = graph.constantWithScalar_dataType_(1.0, self._MPS_F32)
+        v255 = graph.constantWithScalar_dataType_(255.0, self._MPS_F32)
+        x = graph.clampWithTensor_minValueTensor_maxValueTensor_name_(x, zero, one, "clamp")
+        x = graph.multiplicationWithPrimaryTensor_secondaryTensor_name_(x, v255, "scale")
+        out = graph.roundWithTensor_name_(x, "round")
+
+        shaped = G.MPSGraphShapedType.alloc().initWithShape_dataType_(
+            self._shape(1, 1, h, w), self._MPS_F32)
+        exe = graph.compileWithDevice_feeds_targetTensors_targetOperations_compilationDescriptor_(
+            self.gdev, {inp: shaped}, [out], None, None)
+
+        oh, ow = h * 3, w * 3
+        in_bytes, out_bytes = h * w * 4, oh * ow * 4
+        in_buf = self.device.newBufferWithLength_options_(in_bytes, 0)
+        out_buf = self.device.newBufferWithLength_options_(out_bytes, 0)
+        e = {
+            "exe": exe,
+            "in_buf": in_buf, "out_buf": out_buf,
+            "in_td": G.MPSGraphTensorData.alloc().initWithMTLBuffer_shape_dataType_(
+                in_buf, self._shape(1, 1, h, w), self._MPS_F32),
+            "out_td": G.MPSGraphTensorData.alloc().initWithMTLBuffer_shape_dataType_(
+                out_buf, self._shape(1, 1, oh, ow), self._MPS_F32),
+            "in_bytes": in_bytes, "out_bytes": out_bytes,
+            "oh": oh, "ow": ow,
+        }
+        self.cache[(h, w)] = e
+        self._run(e)  # first run finishes any lazy specialization off-frame
+        return e
+
+    def _run(self, e):
+        e["exe"].runWithMTLCommandQueue_inputsArray_resultsArray_executionDescriptor_(
+            self.queue, [e["in_td"]], [e["out_td"]], None)
+
+    def infer(self, luma, h, w):
+        e = self._entry(h, w)
+        x = luma.reshape(-1).astype(np.float32) / 255.0
+        e["in_buf"].contents().as_buffer(e["in_bytes"])[:] = x.tobytes()
+        self._run(e)
+        out = np.frombuffer(e["out_buf"].contents().as_buffer(e["out_bytes"]),
+                            dtype=np.float32)
+        return out.astype(np.uint8).reshape(1, 1, e["oh"], e["ow"])
+
+    def keepalive(self, shape):
+        e = self.cache.get(shape)
+        if e is None:
+            # Never compile on the keep-alive path — a ~0.5s stall is worse
+            # than a cold GPU. Fall back to the tiny warmed shape.
+            e = self.cache.get((8, 8))
+            if e is None:
+                return
+        self._run(e)
+
+
+def make_inference_backend(weights_path):
+    pref = os.environ.get("INFER_BACKEND", "auto")
+    if pref in ("auto", "mpsgraph"):
+        try:
+            return MPSGraphInference(weights_path)
+        except Exception as e:
+            if pref == "mpsgraph":
+                raise
+            print(f"[i] mpsgraph backend unavailable ({e}); falling back to torch")
+    return TorchInference(weights_path)
 
 
 def derive_psk_key(pairing_code: str) -> bytes:
@@ -194,8 +380,8 @@ _gpu_queue = queue.Queue()
 _resp_queue = queue.Queue()
 
 
-def gpu_worker(model, device):
-    """The only thread that ever calls model(). Pulls real work off the
+def gpu_worker(backend):
+    """The only thread that ever calls into the GPU. Pulls real work off the
     queue when there is any; when the queue's empty for long enough that
     the GPU would otherwise idle down (pytorch/pytorch#124056 — confirmed
     open, affects MPS and CUDA both, ~5ms wake-up cost measured here after
@@ -214,10 +400,6 @@ def gpu_worker(model, device):
     into a perfectly periodic cadence that could alias with the request
     cadence or another fixed-period system timer.
     """
-    gpu_bufs = {}  # (h, w) -> persistent GPU input tensor. Safe to own here
-                    # with no locking: this worker is the only thread that
-                    # ever touches it. A game's resolution is fixed for the
-                    # whole session, so this fills in once per distinct shape.
     last_shape = (224, 256)  # SNES native resolution — best guess before any real frame lands
     # Keep-alive tuning, settled empirically at real gameplay cadence:
     #   The tension: a frame-sized dummy warms the GPU best (7.1ms forward vs
@@ -248,10 +430,11 @@ def gpu_worker(model, device):
         try:
             job = _gpu_queue.get(timeout=ping_interval + random.uniform(0.0, ping_interval * 0.15))
         except queue.Empty:
-            # Keep-alive pings only make sense on MPS/CUDA-style GPUs that
-            # drop to a lower power state when idle (pytorch/pytorch#124056);
+            # Keep-alive pings only make sense on GPUs that drop to a lower
+            # power state when idle (pytorch/pytorch#124056 — applies to raw
+            # Metal/MPSGraph identically, verified with GPU timestamps);
             # plain CPU has no such penalty, so don't burn cycles for nothing.
-            if device.type == "mps" and keepalive_mode != "off":
+            if backend.wants_keepalive and keepalive_mode != "off":
                 if keepalive_mode == "tiny":
                     shape = (8, 8)
                 elif keepalive_mode == "hybrid" and last_job_time is not None:
@@ -260,18 +443,11 @@ def gpu_worker(model, device):
                     shape = last_shape if in_safe_window else (8, 8)
                 else:
                     shape = last_shape
-                dummy_buf = gpu_bufs.get(shape)
-                if dummy_buf is None:
-                    h, w = shape
-                    dummy_buf = torch.zeros((1, 1, h, w), dtype=torch.float32, device=device)
-                    gpu_bufs[shape] = dummy_buf
-                with torch.no_grad():
-                    _ = model(dummy_buf)
-                    torch.mps.synchronize()
+                backend.keepalive(shape)
                 last_keepalive_end = time.perf_counter()
             continue
 
-        cpu_view, h, w, meta = job
+        luma, h, w, meta = job
 
         now = time.perf_counter()
         meta["t_dequeue"] = now
@@ -285,17 +461,7 @@ def gpu_worker(model, device):
         last_job_time = now
 
         last_shape = (h, w)
-        gpu_buf = gpu_bufs.get((h, w))
-        if gpu_buf is None:
-            gpu_buf = torch.empty((1, 1, h, w), dtype=torch.float32, device=device)
-            gpu_bufs[(h, w)] = gpu_buf
-
-        with torch.no_grad():
-            gpu_buf.copy_(cpu_view)
-            y = model(gpu_buf)
-            if device.type == "mps":
-                torch.mps.synchronize()
-            out = (y.clamp(0, 1) * 255.0).round().to(torch.uint8).cpu().numpy()
+        out = backend.infer(luma, h, w)
         meta["t_infer"] = time.perf_counter()
         _resp_queue.put((meta, out))
         _gpu_queue.task_done()
@@ -428,6 +594,7 @@ def responder(sock, sessions):
                 # apply it x3 to the output reference, zero-filled — the
                 # diff collapses back to the revealed strip + sprites.
                 diff = np.bitwise_xor(out_flat, ref[0])
+                plain_density = np.count_nonzero(diff[::64])
                 # Shift candidate: prefer the CLIENT's own winning shift
                 # (scaled from its reference frame to ours — with steady
                 # velocity, shift is proportional to how many frames apart
@@ -437,18 +604,26 @@ def responder(sock, sessions):
                 # client had no shift to offer (scene cuts, raw fallbacks).
                 idx = idy = 0
                 fid = meta["frame_id"]
-                if (meta["req_dx"] or meta["req_dy"]) and meta["req_ref"] and fid > meta["req_ref"]:
-                    scale = (fid - held) / (fid - meta["req_ref"])
-                    idx = int(round(meta["req_dx"] * scale))
-                    idy = int(round(meta["req_dy"] * scale))
-                if idx == 0 and idy == 0:
-                    in_cur = sess["inputs"].get(fid)
-                    in_ref = sess["inputs"].get(held)
-                    if (in_cur is not None and in_ref is not None
-                            and in_cur[1] == in_ref[1] and in_cur[2] == in_ref[2]):
-                        idx, idy = estimate_shift(
-                            in_ref[0].reshape(in_ref[2], in_ref[1]),
-                            in_cur[0].reshape(in_cur[2], in_cur[1]))
+                # Quiet frames first: if the plain diff is already near-empty
+                # (< ~2% of samples nonzero), no shift can meaningfully
+                # improve it — skip ALL shift work, including the FFT
+                # fallback, which was otherwise running every frame of
+                # dialogue/menu scenes for nothing (measured: 3.6ms encode
+                # on quiet windows vs 1.1ms on scroll windows, inverted from
+                # what those frames deserve).
+                if plain_density * 50 >= len(diff[::64]):
+                    if (meta["req_dx"] or meta["req_dy"]) and meta["req_ref"] and fid > meta["req_ref"]:
+                        scale = (fid - held) / (fid - meta["req_ref"])
+                        idx = int(round(meta["req_dx"] * scale))
+                        idy = int(round(meta["req_dy"] * scale))
+                    if idx == 0 and idy == 0:
+                        in_cur = sess["inputs"].get(fid)
+                        in_ref = sess["inputs"].get(held)
+                        if (in_cur is not None and in_ref is not None
+                                and in_cur[1] == in_ref[1] and in_cur[2] == in_ref[2]):
+                            idx, idy = estimate_shift(
+                                in_ref[0].reshape(in_ref[2], in_ref[1]),
+                                in_cur[0].reshape(in_cur[2], in_cur[1]))
                 if (idx or idy) and abs(idx) <= MC_MAX_INPUT_SHIFT and abs(idy) <= MC_MAX_INPUT_SHIFT:
                     # Final arbiter is sampled XOR density — the actual
                     # thing compressed size tracks. Covers both a wrong
@@ -573,7 +748,6 @@ def handle_request_complete(sock, sess, frame_id, flags, w, h, buf, uncomp_len,
     if frame_id > sess["latest_input_id"]:
         sess["latest_input_id"] = frame_id
 
-    cpu_view = torch.from_numpy(luma.reshape(1, 1, h, w).astype(np.float32) / 255.0)
     meta = {
         "addr": sess["addr"],
         "token": sess["token"],
@@ -591,7 +765,7 @@ def handle_request_complete(sock, sess, frame_id, flags, w, h, buf, uncomp_len,
         "t_complete": t_complete,
         "t_enqueue": time.perf_counter(),
     }
-    _gpu_queue.put((cpu_view, h, w, meta))
+    _gpu_queue.put((luma, h, w, meta))
 
 
 def main():
@@ -602,15 +776,11 @@ def main():
     ap.add_argument("--port", type=int, default=9876)
     args = ap.parse_args()
 
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-    print(f"[i] using device: {device}")
+    backend = make_inference_backend(args.weights)
+    print(f"[i] inference backend: {backend.name}, weights from {args.weights}")
 
-    model = ESPCN().to(device).eval()
-    load_weights(model, args.weights)
-    print(f"[i] weights loaded from {args.weights}")
-
-    threading.Thread(target=gpu_worker, args=(model, device), daemon=True).start()
-    if device.type == "mps":
+    threading.Thread(target=gpu_worker, args=(backend,), daemon=True).start()
+    if backend.wants_keepalive:
         print("[i] GPU worker started (idles into keep-alive pings when there's no "
               "real work — mitigates the idle-GPU wake-up cost, see pytorch/pytorch#124056)")
     else:
