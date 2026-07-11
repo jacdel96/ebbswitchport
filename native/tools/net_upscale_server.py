@@ -500,8 +500,10 @@ def responder(sock, sessions):
             print(f"[t] {sess['label']}: response avg {sum(st['resp_kb'])/n:.1f}KB "
                   f"({st['diff_frames']} diff / {st['key_frames']} key, "
                   f"{st.get('mc_frames', 0)} motion-compensated), "
-                  f"requests {st['req_diff_frames']} diff / {st['req_raw_frames']} raw")
+                  f"requests {st['req_diff_frames']} diff / {st['req_raw_frames']} raw "
+                  f"({st.get('req_mc_frames', 0)} mc)")
             st["mc_frames"] = 0
+            st["req_mc_frames"] = 0
             st["decode"].clear()
             st["qwait"].clear()
             st["gpu"].clear()
@@ -515,10 +517,11 @@ def responder(sock, sessions):
 
 
 def handle_request_complete(sock, sess, frame_id, flags, w, h, buf, uncomp_len,
-                            ref_id, peer_id, zd, t_first):
+                            ref_id, peer_id, zd, t_first, mc_dx=0, mc_dy=0):
     """Runs in the recv thread once every chunk of a request has landed:
-    decode (decompress / apply diff), stash in the input ring, enqueue for
-    the GPU worker."""
+    decode (decompress / apply diff, shifted when the client sent a
+    motion-compensated diff), stash in the input ring, enqueue for the GPU
+    worker."""
     t_complete = time.perf_counter()
     data = bytes(buf)
 
@@ -540,7 +543,14 @@ def handle_request_complete(sock, sess, frame_id, flags, w, h, buf, uncomp_len,
             sock.sendto(hdr, sess["addr"])
             print(f"[!] {sess['label']}: request diff vs missing input {ref_id} — NACKed")
             return
-        luma = np.bitwise_xor(np.frombuffer(data, dtype=np.uint8), ref[0])
+        ref_plane = ref[0]
+        if (flags & FLAG_MC) and (mc_dx or mc_dy):
+            # Client-predicted scroll shift (from controller direction and/or
+            # our own last reported shift) — mirror of the response path:
+            # rebuild the exact shifted reference the client diffed against.
+            ref_plane = shifted_plane(ref[0], h, w, mc_dy, mc_dx)
+            sess["stats"]["req_mc_frames"] = sess["stats"].get("req_mc_frames", 0) + 1
+        luma = np.bitwise_xor(np.frombuffer(data, dtype=np.uint8), ref_plane)
         sess["stats"]["req_diff_frames"] += 1
     else:
         luma = np.frombuffer(data, dtype=np.uint8)
@@ -661,9 +671,12 @@ def main():
         elif mtype == T_FRAME_REQ and len(data) >= FRAME_HDR.size:
             try:
                 (_, _, flags, chunk_idx, chunk_count, w, h, frame_id,
-                 total_len, uncomp_len, offset, ref_id, peer_id, _, _, token) = \
-                    FRAME_HDR.unpack_from(data)
+                 total_len, uncomp_len, offset, ref_id, peer_id, mc_dx, mc_dy,
+                 token) = FRAME_HDR.unpack_from(data)
             except struct.error:
+                continue
+            if (mc_dx < -MC_MAX_INPUT_SHIFT or mc_dx > MC_MAX_INPUT_SHIFT or
+                    mc_dy < -MC_MAX_INPUT_SHIFT or mc_dy > MC_MAX_INPUT_SHIFT):
                 continue
             sess = sessions.get(addr)
             if sess is None or sess["token"] != token:
@@ -687,7 +700,7 @@ def main():
                 # Common case: whole request in one datagram, no partial needed.
                 handle_request_complete(sock, sess, frame_id, flags, w, h,
                                         payload, uncomp_len, ref_id, peer_id,
-                                        zd, time.perf_counter())
+                                        zd, time.perf_counter(), mc_dx, mc_dy)
                 continue
 
             p = sess["partials"].get(frame_id)
@@ -698,6 +711,7 @@ def main():
                      "count": chunk_count, "flags": flags, "w": w, "h": h,
                      "uncomp_len": uncomp_len, "ref_id": ref_id,
                      "peer_id": peer_id, "total": total_len,
+                     "mc_dx": mc_dx, "mc_dy": mc_dy,
                      "t_first": time.perf_counter(), "t_mono": now}
                 sess["partials"][frame_id] = p
             if (p["count"] != chunk_count or p["total"] != total_len
@@ -711,7 +725,8 @@ def main():
                 del sess["partials"][frame_id]
                 handle_request_complete(sock, sess, frame_id, p["flags"], w, h,
                                         p["buf"], p["uncomp_len"], p["ref_id"],
-                                        p["peer_id"], zd, p["t_first"])
+                                        p["peer_id"], zd, p["t_first"],
+                                        p["mc_dx"], p["mc_dy"])
 
 
 if __name__ == "__main__":

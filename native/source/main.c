@@ -272,6 +272,14 @@ static void video_refresh(const void *data, unsigned width, unsigned height,
                     float y = 0.299f * r + 0.587f * g + 0.114f * b;
                     g_luma_buf[i] = (uint8_t)(y < 0.0f ? 0.0f : (y > 255.0f ? 255.0f : y));
                 }
+                // Directional input predicts camera-scroll direction — seeds
+                // the network thread's request-side motion compensation
+                // (see net_upscale_hint_input's comment; purely advisory).
+                int dir_x = ((g_held & (HidNpadButton_Right | HidNpadButton_StickLRight)) ? 1 : 0)
+                          - ((g_held & (HidNpadButton_Left | HidNpadButton_StickLLeft)) ? 1 : 0);
+                int dir_y = ((g_held & (HidNpadButton_Down | HidNpadButton_StickLDown)) ? 1 : 0)
+                          - ((g_held & (HidNpadButton_Up | HidNpadButton_StickLUp)) ? 1 : 0);
+                net_upscale_hint_input(dir_x, dir_y);
                 // Blocks retro_run() itself (this is called synchronously
                 // from inside it) on this frame's own upscaled result,
                 // rather than treating the network round trip as background
@@ -279,12 +287,10 @@ static void video_refresh(const void *data, unsigned width, unsigned height,
                 // every displayed frame should show ITS OWN result, not
                 // whatever previous round trip happened to land most
                 // recently. Bounded at 60ms (~2x the ~26ms measured wired
-                // round trip, room for jitter without stalling gameplay for
-                // anywhere near secure_recv's much longer 500ms socket-level
-                // budget) — on timeout this just fails soft like everything
-                // else here: present() keeps showing the last successful
-                // result via its own net_upscale_get_result() poll, nothing
-                // hangs or crashes.
+                // round trip, room for jitter without stalling gameplay) —
+                // on timeout this just fails soft like everything else here:
+                // present() keeps showing the last successful result via its
+                // own net_upscale_get_result() poll, nothing hangs or crashes.
                 net_upscale_submit_and_wait(g_luma_buf, width, height, 60, NULL, NULL, NULL);
             }
         }

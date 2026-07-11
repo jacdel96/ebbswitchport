@@ -40,6 +40,9 @@ static const uint8_t NET_MAGIC[4] = { 'E', 'B', 'U', '2' };
                           // frequent. The server estimates the shift; this
                           // side only has to rebuild the shifted reference.
 #define MC_MAX_SHIFT  96 // output-space bound (3x the server's 32px input bound)
+#define MC_MAX_INPUT_SHIFT 32 // input-space bound for request-side MC — the
+                               // header's mc fields carry INPUT-space pixels
+                               // on requests and OUTPUT-space on responses
 
 #define FRAME_HDR_LEN 50
 #define REQ_CHUNK 61440   // request chunk payload — a real 256x224 frame (57KB)
@@ -123,8 +126,21 @@ static uint32_t g_held_output_id;      // newest output we decoded — declared
 static bool g_need_out_key;            // set on response-diff ref miss; asks
                                         // the server for a keyframe via the
                                         // next request's NEED_KEY flag
+static int g_last_resp_shift_dx;       // input-space scroll the server last
+static int g_last_resp_shift_dy;       // reported (response mc / 3) — a prime
+                                        // candidate for request-side motion
+                                        // compensation, since scroll velocity
+                                        // is near-constant frame to frame
 
 static uint32_t g_next_frame_id;       // writer-only
+static int g_last_req_shift_dx, g_last_req_shift_dy;  // writer-only: last
+                                        // shift that actually won — continuity
+                                        // candidate for the next frame
+// Directional-input hint from the game thread (net_upscale_hint_input):
+// which way the player is pushing directly predicts scroll direction, and
+// unlike the last-response shift it's current the instant a walk starts,
+// stops, or turns. Plain ints, advisory only — no lock needed.
+static volatile int g_hint_dir_x, g_hint_dir_y;
 
 // Small result cache, keyed by content hash — catches frames that are
 // pixel-identical to a recent one even when the SNES core doesn't flag them
@@ -208,6 +224,7 @@ static uint64_t g_last_result_hash = 0;   // request hash the latest result answ
 // Writer-thread-only:
 static uint8_t s_send_copy[MAX_W * MAX_H];
 static uint8_t s_diff[MAX_W * MAX_H];                       // request XOR scratch
+static uint8_t s_shift_scratch[MAX_W * MAX_H];              // shifted-reference build
 static uint8_t s_comp[ZSTD_COMPRESSBOUND(MAX_W * MAX_H)];   // request zstd output
 static uint8_t s_dgram[FRAME_HDR_LEN + REQ_CHUNK];          // outgoing datagram build
 // Input ring: the last few frames we SENT, so request diffs can reference
@@ -362,6 +379,24 @@ static void build_shifted(uint8_t *dst, const uint8_t *ref,
         memcpy(drow + dst_x, srow + src_x, copy_w);
         if (dst_x + copy_w < ow) memset(drow + dst_x + copy_w, 0, ow - dst_x - copy_w);
     }
+}
+
+// Sampled count of mismatching pixels between the current frame and the
+// reference shifted by (dx, dy) — the referee that picks which candidate
+// shift (if any) a request diff should use. No prediction has to be RIGHT;
+// wrong candidates just lose this comparison. Margins exceed
+// MC_MAX_INPUT_SHIFT so shifted lookups never leave the buffer; stride-7
+// sampling is ~500 points on a real frame, a few microseconds each call.
+static unsigned eval_shift_sampled(const uint8_t *cur, const uint8_t *ref,
+                                    unsigned w, unsigned h, int dx, int dy) {
+    unsigned mismatch = 0;
+    for (unsigned y = 40; y + 40 < h; y += 7) {
+        const uint8_t *crow = cur + (size_t)y * w;
+        const uint8_t *rrow = ref + (size_t)((int)y - dy) * w;
+        for (unsigned x = 40; x + 40 < w; x += 7)
+            if (crow[x] != rrow[(int)x - dx]) mismatch++;
+    }
+    return mismatch;
 }
 
 // HKDF(SHA-256, salt, ikm, info) -> 32 bytes. Mirrors
@@ -628,6 +663,15 @@ static void reader_thread_func(void *arg) {
         mutexLock(&g_inflight_lock);
         g_held_output_id = rs->frame_id;
         if (rs->peer_id > g_acked_input_id) g_acked_input_id = rs->peer_id;
+        if (rs->flags & FLAG_MC) {
+            // Remember the server's scroll estimate (input-space) — the
+            // writer uses it as a candidate for request-side motion
+            // compensation. Kept when a non-MC frame arrives (menus pause
+            // scroll but walks resume at the same velocity); it's only ever
+            // a candidate, so staleness costs nothing.
+            g_last_resp_shift_dx = rs->mc_dx / 3;
+            g_last_resp_shift_dy = rs->mc_dy / 3;
+        }
         for (int i = 0; i < MAX_INFLIGHT; i++)
             if (g_inflight[i].used && g_inflight[i].frame_id == rs->frame_id) {
                 entry = g_inflight[i];
@@ -666,16 +710,77 @@ static bool send_request(int sock, unsigned sw, unsigned sh, uint32_t fid) {
                               // re-sets it — self-healing
     mutexUnlock(&g_inflight_lock);
 
+    int mc_dx = 0, mc_dy = 0;
     if (g_session_compression && acked != 0) {
         int ref = -1;
         for (int i = 0; i < IN_RING; i++)
             if (s_in_ring_id[i] == acked && s_in_ring_w[i] == sw && s_in_ring_h[i] == sh) { ref = i; break; }
         if (ref >= 0) {
-            xor_buffers(s_diff, s_send_copy, s_in_ring[ref], total_raw);
+            // Motion compensation for the request leg: camera scroll makes
+            // the plain XOR dense right when frames are most frequent, so
+            // requests were falling back to raw 57KB exactly during motion.
+            // The Switch can't afford real motion ESTIMATION — but it can
+            // afford to TEST a few candidate shifts with the sampled referee
+            // and use whichever explains the frame best. None of the
+            // predictions has to be right: a wrong shift just loses the
+            // comparison (or, worst case, produces a dense diff that the
+            // existing raw fallback catches). Candidates:
+            //   - (0, 0): the plain diff — menus/dialogue, scroll stopped
+            //   - the server's last reported shift (and 2x it, since the
+            //     ACKed reference can lag two frames): nails steady scroll
+            //   - the last shift that won here: continuity
+            //   - controller-direction guesses at a couple of magnitudes,
+            //     both sign conventions: current the instant a walk starts,
+            //     stops, or turns, when the last-shift candidates lag
+            if (sw > 80 && sh > 80) {
+                int hx = g_hint_dir_x, hy = g_hint_dir_y;
+                mutexLock(&g_inflight_lock);
+                int lrx = g_last_resp_shift_dx, lry = g_last_resp_shift_dy;
+                mutexUnlock(&g_inflight_lock);
+                int cand[12][2];
+                int ncand = 0;
+                cand[ncand][0] = 0; cand[ncand][1] = 0; ncand++;
+                int raw_cand[][2] = {
+                    { lrx, lry }, { 2 * lrx, 2 * lry },
+                    { g_last_req_shift_dx, g_last_req_shift_dy },
+                    { -2 * hx, -2 * hy }, { -4 * hx, -4 * hy },
+                    { 2 * hx, 2 * hy }, { 4 * hx, 4 * hy },
+                };
+                for (unsigned c = 0; c < sizeof(raw_cand) / sizeof(raw_cand[0]); c++) {
+                    int dx = raw_cand[c][0], dy = raw_cand[c][1];
+                    if (dx == 0 && dy == 0) continue;
+                    if (dx < -MC_MAX_INPUT_SHIFT || dx > MC_MAX_INPUT_SHIFT ||
+                        dy < -MC_MAX_INPUT_SHIFT || dy > MC_MAX_INPUT_SHIFT) continue;
+                    bool dup = false;
+                    for (int k = 0; k < ncand; k++)
+                        if (cand[k][0] == dx && cand[k][1] == dy) { dup = true; break; }
+                    if (!dup && ncand < 12) { cand[ncand][0] = dx; cand[ncand][1] = dy; ncand++; }
+                }
+                unsigned zero_score = eval_shift_sampled(s_send_copy, s_in_ring[ref], sw, sh, 0, 0);
+                unsigned best_score = zero_score;
+                for (int c = 1; c < ncand; c++) {
+                    unsigned e = eval_shift_sampled(s_send_copy, s_in_ring[ref], sw, sh,
+                                                    cand[c][0], cand[c][1]);
+                    if (e < best_score) { best_score = e; mc_dx = cand[c][0]; mc_dy = cand[c][1]; }
+                }
+                // Only shift when it's CLEARLY better — a marginal win isn't
+                // worth the extra shifted-copy work or a noisier diff.
+                if ((mc_dx || mc_dy) && !(best_score * 4 <= zero_score * 3)) {
+                    mc_dx = mc_dy = 0;
+                }
+            }
+
+            const uint8_t *diff_ref = s_in_ring[ref];
+            if (mc_dx || mc_dy) {
+                build_shifted(s_shift_scratch, s_in_ring[ref], sw, sh, mc_dx, mc_dy);
+                diff_ref = s_shift_scratch;
+            }
+            xor_buffers(s_diff, s_send_copy, diff_ref, total_raw);
             // Sparsity pre-check before spending CPU on zstd: sample every
-            // 64th byte; a scene cut / camera scroll produces a dense XOR
-            // plane that compresses poorly — cheaper to just send raw. (This
-            // is also, incidentally, a free scene-change detector.)
+            // 64th byte; a scene cut (or a scroll none of the candidates
+            // explained) produces a dense XOR plane that compresses poorly —
+            // cheaper to just send raw. (This is also, incidentally, a free
+            // scene-change detector.)
             unsigned nonzero = 0, samples = 0;
             for (uint32_t i = 0; i < total_raw; i += 64, samples++)
                 if (s_diff[i]) nonzero++;
@@ -685,11 +790,15 @@ static bool send_request(int sock, unsigned sw, unsigned sh, uint32_t fid) {
                     payload = s_comp;
                     payload_len = (uint32_t)c;
                     flags = FLAG_COMP | FLAG_DIFF;
+                    if (mc_dx || mc_dy) flags |= FLAG_MC;
                     ref_id = acked;
                 }
             }
         }
     }
+    if (!(flags & FLAG_DIFF)) mc_dx = mc_dy = 0;  // raw fallback carries no shift
+    g_last_req_shift_dx = mc_dx;
+    g_last_req_shift_dy = mc_dy;
     if (need_key) flags |= FLAG_NEED_KEY;
 
     unsigned count = (payload_len + REQ_CHUNK - 1) / REQ_CHUNK;
@@ -698,6 +807,7 @@ static bool send_request(int sock, unsigned sw, unsigned sh, uint32_t fid) {
         .type = T_FRAME_REQ, .flags = flags, .chunk_count = count,
         .w = sw, .h = sh, .frame_id = fid, .total_len = payload_len,
         .uncomp_len = total_raw, .ref_id = ref_id, .peer_id = held,
+        .mc_dx = mc_dx, .mc_dy = mc_dy,
         .token = g_token,
     };
     for (unsigned i = 0; i < count; i++) {
@@ -867,6 +977,11 @@ static const SocketInitConfig s_sockCfg = {
     .num_bsd_sessions    = 3,
     .bsd_service_type    = BsdServiceType_User,
 };
+
+void net_upscale_hint_input(int dir_x, int dir_y) {
+    g_hint_dir_x = dir_x;
+    g_hint_dir_y = dir_y;
+}
 
 void net_upscale_set_compression(bool compression) {
     g_want_compression = compression;

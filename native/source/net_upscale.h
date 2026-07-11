@@ -66,6 +66,17 @@ bool net_upscale_init(const char *host_port, const char *pairing_code, bool comp
 // the old setting — a real mixed state hit on hardware).
 void net_upscale_set_compression(bool compression);
 
+// Advisory hint: which way the player is currently pushing (each of dir_x /
+// dir_y in {-1, 0, 1}). Directional input directly predicts camera-scroll
+// direction, so the network thread uses it to seed candidate shifts for
+// request-side motion compensation — current the instant a walk starts,
+// stops, or turns, where the other candidates (the server's last reported
+// shift) lag a frame. Purely advisory: every candidate is TESTED against the
+// actual frame content before use, so a wrong (or missing) hint costs
+// nothing but a slightly bigger payload. Call once per game frame, before
+// net_upscale_submit_frame/submit_and_wait.
+void net_upscale_hint_input(int dir_x, int dir_y);
+
 // Submits this frame's luma plane (tightly packed, w*h bytes, w/h <= 512) for
 // network upscaling. Non-blocking: copies into a single pending-send slot.
 // If the previous submission hasn't been picked up by the network thread
