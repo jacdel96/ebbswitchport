@@ -642,6 +642,17 @@ bool gpu_video_network_upscale_active(void) {
 // resolution scaled by ESPCN_SCALE — anything else is a stale response for
 // a since-changed resolution and is dropped rather than risking sampling
 // g_gameScratch out of bounds.
+// Per-source-pixel chroma offsets for the network-result recombine (below).
+// Each source pixel's chroma is shared by its whole 3x3 output block, so
+// this is 9x less chroma math than computing it per output pixel — and it
+// also means the CPU-uncached game scratch gets read once per source pixel
+// instead of nine times (uncached reads are painfully slow on this CPU;
+// the original per-output-pixel float version of this function measured in
+// the ~100ms range and single-handedly capped the whole game loop at ~6fps).
+static int16_t s_chroma_dr[ESPCN_MAX_W * ESPCN_MAX_H];
+static int16_t s_chroma_dg[ESPCN_MAX_W * ESPCN_MAX_H];
+static int16_t s_chroma_db[ESPCN_MAX_W * ESPCN_MAX_H];
+
 void gpu_video_upload_network_result(const uint8_t *luma, unsigned w, unsigned h) {
     if (!g_ready || !luma || !g_network_enabled) return;
     if (g_game_w == 0 || w != g_game_w * ESPCN_SCALE || h != g_game_h * ESPCN_SCALE) return;
@@ -650,30 +661,46 @@ void gpu_video_upload_network_result(const uint8_t *luma, unsigned w, unsigned h
     const uint32_t *src = (const uint32_t *)dkMemBlockGetCpuAddr(g_gameScratch[g_parity]);
     uint32_t *dst = (uint32_t *)dkMemBlockGetCpuAddr(g_networkScratch[g_parity]);
 
-    for (unsigned oy = 0; oy < h; oy++) {
-        unsigned sy = oy / ESPCN_SCALE;
-        for (unsigned ox = 0; ox < w; ox++) {
-            unsigned sx = ox / ESPCN_SCALE;
-            uint32_t srgba = src[sy * g_game_w + sx];
-            float r = (float)(srgba & 0xFF) / 255.0f;
-            float g = (float)((srgba >> 8) & 0xFF) / 255.0f;
-            float b = (float)((srgba >> 16) & 0xFF) / 255.0f;
-            float cb = -0.168736f * r - 0.331264f * g + 0.5f * b + 0.5f;
-            float cr = 0.5f * r - 0.418688f * g - 0.081312f * b + 0.5f;
-            float yNew = (float)luma[oy * w + ox] / 255.0f;
+    // Integer fixed-point YCbCr recombine, two passes. All coefficients are
+    // the same BT.601 constants the float version (and espcn3_comp.glsl's
+    // shader tail) uses, scaled by 256 and rounded — worst-case error vs the
+    // float math is ~1 LSB, far below anything visible.
+    //
+    // Pass 1: chroma offsets per SOURCE pixel. cbx/crx are (cb-0.5) and
+    // (cr-0.5) in 255-scale, x256; dr/dg/db are the RGB deltas to add to the
+    // new luma, in plain pixel units (range ±~180, comfortably s16).
+    unsigned gw = g_game_w, gh = g_game_h;
+    for (unsigned i = 0; i < gw * gh; i++) {
+        uint32_t px = src[i];
+        int r = (int)(px & 0xFF), g = (int)((px >> 8) & 0xFF), b = (int)((px >> 16) & 0xFF);
+        int32_t cbx = -43 * r - 85 * g + 128 * b;   // 256*(-0.168736 r -0.331264 g +0.5 b)
+        int32_t crx = 128 * r - 107 * g - 21 * b;   // 256*(0.5 r -0.418688 g -0.081312 b)
+        s_chroma_dr[i] = (int16_t)((359 * crx + 32768) >> 16);              // 1.402 (cr-.5)
+        s_chroma_dg[i] = (int16_t)((-88 * cbx - 183 * crx + 32768) >> 16);  // -.344 cb -.714 cr
+        s_chroma_db[i] = (int16_t)((454 * cbx + 32768) >> 16);              // 1.772 (cb-.5)
+    }
 
-            float rr = yNew + 1.402f * (cr - 0.5f);
-            float gg = yNew - 0.344136f * (cb - 0.5f) - 0.714136f * (cr - 0.5f);
-            float bb = yNew + 1.772f * (cb - 0.5f);
-            rr = rr < 0.0f ? 0.0f : (rr > 1.0f ? 1.0f : rr);
-            gg = gg < 0.0f ? 0.0f : (gg > 1.0f ? 1.0f : gg);
-            bb = bb < 0.0f ? 0.0f : (bb > 1.0f ? 1.0f : bb);
-
-            uint32_t out = 0xFF000000u |
-                           ((uint32_t)(bb * 255.0f + 0.5f) << 16) |
-                           ((uint32_t)(gg * 255.0f + 0.5f) << 8) |
-                           (uint32_t)(rr * 255.0f + 0.5f);
-            dst[oy * w + ox] = out;
+    // Pass 2: per output pixel, just luma + offset + clamp + pack — a
+    // handful of integer ops, no divides, no floats, sequential access.
+    for (unsigned sy = 0; sy < gh; sy++) {
+        const int16_t *drr = s_chroma_dr + (size_t)sy * gw;
+        const int16_t *dgr = s_chroma_dg + (size_t)sy * gw;
+        const int16_t *dbr = s_chroma_db + (size_t)sy * gw;
+        for (unsigned oy = sy * ESPCN_SCALE; oy < sy * ESPCN_SCALE + ESPCN_SCALE; oy++) {
+            const uint8_t *lrow = luma + (size_t)oy * w;
+            uint32_t *drow = dst + (size_t)oy * w;
+            for (unsigned sx = 0; sx < gw; sx++) {
+                int dr = drr[sx], dg = dgr[sx], db = dbr[sx];
+                unsigned ox = sx * ESPCN_SCALE;
+                for (unsigned k = 0; k < ESPCN_SCALE; k++, ox++) {
+                    int y = (int)lrow[ox];
+                    int r = y + dr, g = y + dg, b = y + db;
+                    r = r < 0 ? 0 : (r > 255 ? 255 : r);
+                    g = g < 0 ? 0 : (g > 255 ? 255 : g);
+                    b = b < 0 ? 0 : (b > 255 ? 255 : b);
+                    drow[ox] = 0xFF000000u | ((uint32_t)b << 16) | ((uint32_t)g << 8) | (uint32_t)r;
+                }
+            }
         }
     }
     g_network_pending_w = w;

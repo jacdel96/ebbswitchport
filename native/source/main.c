@@ -220,6 +220,28 @@ static void net_timing_tick(unsigned us) {
     g_net_us_window_max = 0;
 }
 
+// present()-loop timing — the display path's cost (recombine, uploads, GPU
+// present, vsync wait), which RUN and NET are both blind to. Added while
+// chasing "HUD says 6fps with NET at 18ms": the CPU-side network-result
+// recombine lived here, invisible to every other HUD metric.
+static unsigned long long g_pres_us_sum = 0;
+static unsigned g_pres_us_count = 0;
+static unsigned g_pres_us_window_max = 0;
+static unsigned g_pres_avg_us = 0;
+static unsigned g_pres_max_us = 0;
+
+static void pres_timing_tick(unsigned us) {
+    g_pres_us_sum += us;
+    g_pres_us_count++;
+    if (us > g_pres_us_window_max) g_pres_us_window_max = us;
+    if (g_pres_us_count < 60) return;
+    g_pres_avg_us = (unsigned)(g_pres_us_sum / g_pres_us_count);
+    g_pres_max_us = g_pres_us_window_max;
+    g_pres_us_sum = 0;
+    g_pres_us_count = 0;
+    g_pres_us_window_max = 0;
+}
+
 // --- rendering backend selection ---------------------------------------------
 // GPU (deko3d) path state — populated only when g_use_gpu is true.
 static bool g_use_gpu = false;
@@ -752,7 +774,7 @@ static void draw_menu(u32 *fb, u32 stride) {
 static void draw_hud(u32 *fb, u32 stride, u32 canvas_h, int x0, int y0) {
     AudioStats as;
     audio_stats(&as);
-    char line1[80], line2[48], line3[48];
+    char line1[80], line2[80], line3[48];
     bool ai_active = g_use_gpu && gpu_video_ai_upscale_active();
     bool net_active = g_use_gpu && g_settings.net_upscale && g_net_initialized;
     // g_use_gpu reflects the backend actually running this session (settings
@@ -767,10 +789,14 @@ static void draw_hud(u32 *fb, u32 stride, u32 canvas_h, int x0, int y0) {
              g_fps_x10 / 10, g_fps_x10 % 10, (as.ring_frames + as.inflight_frames) / 48,
              g_lag_pct, g_overclock_boost ? "  OC" : "");
     // Direct retro_run() timing — see run_timing_tick's comment for why this
-    // exists alongside (and is more trustworthy than) LAG %.
+    // exists alongside (and is more trustworthy than) LAG %. PRES is the
+    // display path's own cost (recombine/uploads/present/vsync), which RUN
+    // and NET are both blind to — FPS ~= 1000 / (RUN + PRES).
     unsigned avg_x10 = g_run_avg_us / 100, max_x10 = g_run_max_us / 100;  // tenths of a ms
-    snprintf(line2, sizeof(line2), "RUN avg %u.%ums  max %u.%ums",
-             avg_x10 / 10, avg_x10 % 10, max_x10 / 10, max_x10 % 10);
+    unsigned pres_x10 = g_pres_avg_us / 100, presmax_x10 = g_pres_max_us / 100;
+    snprintf(line2, sizeof(line2), "RUN %u.%u/%u.%ums  PRES %u.%u/%u.%ums",
+             avg_x10 / 10, avg_x10 % 10, max_x10 / 10, max_x10 % 10,
+             pres_x10 / 10, pres_x10 % 10, presmax_x10 / 10, presmax_x10 % 10);
     // Experimental AI (ESPCN) upscale timing — only shown while it's actually
     // running (GPU path, weights present, enabled, resolution in range).
     // Mutually exclusive with the network path (see settings_adjust), so at
@@ -838,10 +864,15 @@ static void present(void) {
             const uint8_t *result_luma;
             unsigned rw, rh;
             if (net_upscale_get_result(&result_luma, &rw, &rh)) {
-                gpu_video_upload_network_result(result_luma, rw, rh);
+                // Only recombine+upload when a genuinely NEW result landed.
+                // The unconditional version re-ran the full CPU recombine on
+                // the same latched result every single present() — the
+                // uploaded texture persists, so skipping is free correctness-
+                // wise, and re-doing it was pure waste.
                 unsigned gen = net_upscale_get_result_generation();
                 if (gen != g_net_last_generation) {
                     g_net_last_generation = gen;
+                    gpu_video_upload_network_result(result_luma, rw, rh);
                     net_timing_tick(net_upscale_get_last_rtt_us());
                 }
             }
@@ -987,7 +1018,11 @@ int main(int argc, char **argv) {
             if (frame % 3600 == 0)   state_save("auto1");  // auto ~every 1 min
             if (frame % 36000 == 0)  state_save("auto10"); // auto ~every 10 min
         }
+        u64 pres_t0 = armGetSystemTick();
         present();
+        if (!g_menu_open)  // menu present() builds the whole menu — not the
+                            // display-path cost this metric exists to expose
+            pres_timing_tick((unsigned)(armTicksToNs(armGetSystemTick() - pres_t0) / 1000));
     }
 
     sram_save();            // final flush on exit
