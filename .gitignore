@@ -24,3 +24,6 @@ native/lib/*.a
 .DS_Store
 .venv/
 __pycache__/
+native/netbench/build/
+native/netbench/*.elf
+native/netbench/*.nacp
