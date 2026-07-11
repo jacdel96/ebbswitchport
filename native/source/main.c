@@ -19,6 +19,7 @@
 #include "osd.h"
 #include "pixfmt.h"
 #include "save_io.h"
+#include "telemetry.h"
 #include "settings.h"
 
 #ifndef GAME_ID
@@ -256,6 +257,8 @@ static PixelLut g_pixlut = {0};         // shared 16bpp->RGBA8 LUT (CPU and GPU 
 static bool g_net_initialized = false;  // net_upscale_init has been called this session
 static uint8_t *g_luma_buf = NULL;      // scratch: luma extracted from g_native_frame
 static unsigned g_luma_cap = 0;
+static uint64_t g_net_last_upload_hash = 0; // result hash last recombined+uploaded —
+                                             // see the pixels-changed gate in present()
 static unsigned g_net_last_generation = 0;  // last net_upscale_get_result_generation()
                                              // we ticked timing for — see net_timing_tick
 
@@ -864,15 +867,21 @@ static void present(void) {
             const uint8_t *result_luma;
             unsigned rw, rh;
             if (net_upscale_get_result(&result_luma, &rw, &rh)) {
-                // Only recombine+upload when a genuinely NEW result landed.
+                // Only recombine+upload when the result's PIXELS changed.
                 // The unconditional version re-ran the full CPU recombine on
-                // the same latched result every single present() — the
-                // uploaded texture persists, so skipping is free correctness-
-                // wise, and re-doing it was pure waste.
+                // the same latched result every single present(); gating on
+                // the generation counter alone still re-ran it on every
+                // cache hit (generation bumps, pixels identical — standing
+                // still, that's every frame). The uploaded texture persists,
+                // so skipping is free correctness-wise.
                 unsigned gen = net_upscale_get_result_generation();
                 if (gen != g_net_last_generation) {
                     g_net_last_generation = gen;
-                    gpu_video_upload_network_result(result_luma, rw, rh);
+                    uint64_t rhash = net_upscale_get_result_hash();
+                    if (rhash != g_net_last_upload_hash) {
+                        g_net_last_upload_hash = rhash;
+                        gpu_video_upload_network_result(result_luma, rw, rh);
+                    }
                     net_timing_tick(net_upscale_get_last_rtt_us());
                 }
             }
@@ -946,6 +955,7 @@ int main(int argc, char **argv) {
 
     romfsInit();
     save_io_init();
+    telemetry_init();
 
     settings_load(&g_settings);
     audio_preset_sync();
@@ -1014,6 +1024,16 @@ int main(int argc, char **argv) {
             run_timing_tick((unsigned)(armTicksToNs(armGetSystemTick() - run_t0) / 1000));
             fps_tick();                 // only counts real gameplay frames
             frame++;
+            if (frame % 120 == 0)                       // stats to SD ~every 2-5s
+                telemetry_printf("fps %u.%u run %u.%u/%u.%u pres %u.%u/%u.%u net %u.%u/%u.%u lag %u%%",
+                                  g_fps_x10 / 10, g_fps_x10 % 10,
+                                  g_run_avg_us / 1000, (g_run_avg_us / 100) % 10,
+                                  g_run_max_us / 1000, (g_run_max_us / 100) % 10,
+                                  g_pres_avg_us / 1000, (g_pres_avg_us / 100) % 10,
+                                  g_pres_max_us / 1000, (g_pres_max_us / 100) % 10,
+                                  g_net_avg_us / 1000, (g_net_avg_us / 100) % 10,
+                                  g_net_max_us / 1000, (g_net_max_us / 100) % 10,
+                                  g_lag_pct);
             if (frame % 600 == 0)    sram_save();          // SRAM ~every 10s
             if (frame % 3600 == 0)   state_save("auto1");  // auto ~every 1 min
             if (frame % 36000 == 0)  state_save("auto10"); // auto ~every 10 min
@@ -1032,6 +1052,7 @@ int main(int argc, char **argv) {
 cleanup:
     if (g_net_initialized) net_upscale_exit();
     free(g_luma_buf);
+    telemetry_exit();
     save_io_exit();
     audio_exit();
     retro_deinit();

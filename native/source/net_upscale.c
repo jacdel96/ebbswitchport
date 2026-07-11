@@ -1175,6 +1175,12 @@ unsigned net_upscale_get_result_generation(void) {
     return g_result_generation;
 }
 
+uint64_t net_upscale_get_result_hash(void) {
+    // Lock-free read is fine: aligned u64 loads are atomic on aarch64, and
+    // this is a display-side gate, not a correctness boundary.
+    return g_last_result_hash;
+}
+
 void net_upscale_exit(void) {
     if (!g_ready) return;
     g_ready = false;

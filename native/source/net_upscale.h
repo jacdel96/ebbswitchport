@@ -121,6 +121,14 @@ unsigned net_upscale_get_last_rtt_us(void);
 // value has changed since their last observation.
 unsigned net_upscale_get_result_generation(void);
 
+// Content hash of the request the current result answers. The generation
+// counter bumps on CACHE hits too (same pixels re-served), so display work
+// that only depends on the pixels — the CPU recombine + texture upload —
+// should gate on this instead: identical hash means identical result, no
+// re-upload needed. (Standing still, every frame is a cache hit; gating on
+// generation alone re-ran the full recombine per frame for nothing.)
+uint64_t net_upscale_get_result_hash(void);
+
 // Stops the background threads and closes the socket. Safe to call even if
 // net_upscale_init was never called, or failed.
 void net_upscale_exit(void);
