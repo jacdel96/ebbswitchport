@@ -737,14 +737,25 @@ static bool send_request(int sock, unsigned sw, unsigned sh, uint32_t fid) {
                 mutexLock(&g_inflight_lock);
                 int lrx = g_last_resp_shift_dx, lry = g_last_resp_shift_dy;
                 mutexUnlock(&g_inflight_lock);
-                int cand[12][2];
+                int cand[20][2];
                 int ncand = 0;
                 cand[ncand][0] = 0; cand[ncand][1] = 0; ncand++;
+                // Wider net than the first cut: hardware logs showed whole
+                // scroll stretches falling back to raw because the actual
+                // per-network-frame shift (walk speed x however many game
+                // frames elapsed) landed between the sparse magnitudes
+                // {2,4}. The referee is microseconds per candidate — a
+                // denser set costs nothing and catches the in-between and
+                // drifting-velocity cases: the last-response shift's +-1
+                // neighborhood, and hint magnitudes 1..6.
                 int raw_cand[][2] = {
                     { lrx, lry }, { 2 * lrx, 2 * lry },
+                    { lrx + 1, lry }, { lrx - 1, lry },
+                    { lrx, lry + 1 }, { lrx, lry - 1 },
                     { g_last_req_shift_dx, g_last_req_shift_dy },
-                    { -2 * hx, -2 * hy }, { -4 * hx, -4 * hy },
-                    { 2 * hx, 2 * hy }, { 4 * hx, 4 * hy },
+                    { -1 * hx, -1 * hy }, { -2 * hx, -2 * hy },
+                    { -3 * hx, -3 * hy }, { -4 * hx, -4 * hy },
+                    { -6 * hx, -6 * hy }, { 2 * hx, 2 * hy },
                 };
                 for (unsigned c = 0; c < sizeof(raw_cand) / sizeof(raw_cand[0]); c++) {
                     int dx = raw_cand[c][0], dy = raw_cand[c][1];
@@ -754,7 +765,7 @@ static bool send_request(int sock, unsigned sw, unsigned sh, uint32_t fid) {
                     bool dup = false;
                     for (int k = 0; k < ncand; k++)
                         if (cand[k][0] == dx && cand[k][1] == dy) { dup = true; break; }
-                    if (!dup && ncand < 12) { cand[ncand][0] = dx; cand[ncand][1] = dy; ncand++; }
+                    if (!dup && ncand < 20) { cand[ncand][0] = dx; cand[ncand][1] = dy; ncand++; }
                 }
                 unsigned zero_score = eval_shift_sampled(s_send_copy, s_in_ring[ref], sw, sh, 0, 0);
                 unsigned best_score = zero_score;

@@ -428,26 +428,39 @@ def responder(sock, sessions):
                 # apply it x3 to the output reference, zero-filled — the
                 # diff collapses back to the revealed strip + sprites.
                 diff = np.bitwise_xor(out_flat, ref[0])
-                in_cur = sess["inputs"].get(meta["frame_id"])
-                in_ref = sess["inputs"].get(held)
-                if (in_cur is not None and in_ref is not None
-                        and in_cur[1] == in_ref[1] and in_cur[2] == in_ref[2]):
-                    idx, idy = estimate_shift(
-                        in_ref[0].reshape(in_ref[2], in_ref[1]),
-                        in_cur[0].reshape(in_cur[2], in_cur[1]))
-                    if idx or idy:
-                        # Final arbiter is sampled XOR density — the actual
-                        # thing compressed size tracks — not the SAD gate
-                        # alone: parallax layers scrolling at different rates
-                        # can pass the shift sanity check while the shifted
-                        # diff ends up no sparser than the plain one.
-                        shifted = shifted_plane(ref[0], out_h, out_w, idy * 3, idx * 3)
-                        mc_diff = np.bitwise_xor(out_flat, shifted)
-                        if (np.count_nonzero(mc_diff[::64])
-                                < np.count_nonzero(diff[::64])):
-                            diff = mc_diff
-                            mc_dx, mc_dy = idx * 3, idy * 3
-                            flags |= FLAG_MC
+                # Shift candidate: prefer the CLIENT's own winning shift
+                # (scaled from its reference frame to ours — with steady
+                # velocity, shift is proportional to how many frames apart
+                # the reference is) — it rides in every MC request header
+                # and makes the FFT estimate unnecessary on steady scroll,
+                # which was ~1.5ms of every encode. FFT only runs when the
+                # client had no shift to offer (scene cuts, raw fallbacks).
+                idx = idy = 0
+                fid = meta["frame_id"]
+                if (meta["req_dx"] or meta["req_dy"]) and meta["req_ref"] and fid > meta["req_ref"]:
+                    scale = (fid - held) / (fid - meta["req_ref"])
+                    idx = int(round(meta["req_dx"] * scale))
+                    idy = int(round(meta["req_dy"] * scale))
+                if idx == 0 and idy == 0:
+                    in_cur = sess["inputs"].get(fid)
+                    in_ref = sess["inputs"].get(held)
+                    if (in_cur is not None and in_ref is not None
+                            and in_cur[1] == in_ref[1] and in_cur[2] == in_ref[2]):
+                        idx, idy = estimate_shift(
+                            in_ref[0].reshape(in_ref[2], in_ref[1]),
+                            in_cur[0].reshape(in_cur[2], in_cur[1]))
+                if (idx or idy) and abs(idx) <= MC_MAX_INPUT_SHIFT and abs(idy) <= MC_MAX_INPUT_SHIFT:
+                    # Final arbiter is sampled XOR density — the actual
+                    # thing compressed size tracks. Covers both a wrong
+                    # scaled client shift and parallax layers that pass an
+                    # estimate but don't actually sparsify the diff.
+                    shifted = shifted_plane(ref[0], out_h, out_w, idy * 3, idx * 3)
+                    mc_diff = np.bitwise_xor(out_flat, shifted)
+                    if (np.count_nonzero(mc_diff[::64])
+                            < np.count_nonzero(diff[::64])):
+                        diff = mc_diff
+                        mc_dx, mc_dy = idx * 3, idy * 3
+                        flags |= FLAG_MC
                 payload = zc.compress(diff.tobytes())
                 flags |= FLAG_COMP | FLAG_DIFF
                 ref_id = held
@@ -568,6 +581,12 @@ def handle_request_complete(sock, sess, frame_id, flags, w, h, buf, uncomp_len,
         "compression": sess["compression"],
         "held_output_id": peer_id,
         "need_key": bool(flags & FLAG_NEED_KEY),
+        # The client's own winning scroll shift (and what it was relative
+        # to) — lets the responder skip the FFT motion estimate entirely on
+        # steady scroll; see the responder's candidate logic.
+        "req_dx": mc_dx if (flags & FLAG_MC) else 0,
+        "req_dy": mc_dy if (flags & FLAG_MC) else 0,
+        "req_ref": ref_id if (flags & FLAG_DIFF) else 0,
         "t_first": t_first,
         "t_complete": t_complete,
         "t_enqueue": time.perf_counter(),
