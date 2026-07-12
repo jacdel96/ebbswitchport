@@ -20,6 +20,9 @@ native/.icon.jpg
 native/vendor/snes9x/
 native/lib/*.a
 
+# SR training data (map rips / frames / teacher outputs / selections) — never commit
+training_data/
+
 # OS noise
 .DS_Store
 .venv/

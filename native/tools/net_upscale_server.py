@@ -71,6 +71,7 @@ import socket
 import struct
 import threading
 import time
+import zlib
 import zstandard as zstd
 
 import numpy as np
@@ -115,14 +116,18 @@ PARTIAL_TTL_S = 2.0
 
 
 class ESPCN(nn.Module):
-    """Matches native/source/shaders/espcn{1,2,3}_comp.glsl exactly — same
-    layer shapes, same tanh placement, same lack of activation on layer 3."""
+    """Matches native/source/shaders/espcn{1,2,3}_comp.glsl — same topology,
+    same tanh placement, same lack of activation on layer 3.  Channel widths
+    and kernel sizes default to the original 64/32 5-3-3 but are derived from
+    the loaded ESP1 array shapes by TorchInference (mirroring what
+    MPSGraphInference already does), so slimmer distilled checkpoints from
+    native/tools/distill/train_student.py load through the same class."""
 
-    def __init__(self):
+    def __init__(self, c1=64, c2=32, k1=5, k2=3, k3=3):
         super().__init__()
-        self.conv1 = nn.Conv2d(1, 64, 5, padding=2)
-        self.conv2 = nn.Conv2d(64, 32, 3, padding=1)
-        self.conv3 = nn.Conv2d(32, 9, 3, padding=1)
+        self.conv1 = nn.Conv2d(1, c1, k1, padding=k1 // 2)
+        self.conv2 = nn.Conv2d(c1, c2, k2, padding=k2 // 2)
+        self.conv3 = nn.Conv2d(c2, 9, k3, padding=k3 // 2)
         self.shuffle = nn.PixelShuffle(3)
         self.tanh = nn.Tanh()
 
@@ -193,7 +198,9 @@ def load_weights(model, bin_path):
 class TorchInference:
     def __init__(self, weights_path):
         self.device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-        self.model = ESPCN().to(self.device).eval()
+        w1, _, w2, _, w3, _ = read_weight_arrays(weights_path)
+        self.model = ESPCN(c1=w1.shape[0], c2=w2.shape[0], k1=w1.shape[2],
+                           k2=w2.shape[2], k3=w3.shape[2]).to(self.device).eval()
         load_weights(self.model, weights_path)
         self.bufs = {}   # (h, w) -> persistent GPU input tensor (worker-thread-only)
         self.wants_keepalive = self.device.type == "mps"
@@ -269,8 +276,10 @@ class MPSGraphInference:
             return graph.constantWithData_shape_dataType_(
                 data, self._shape(*dims), self._MPS_F32)
 
-        def conv(x, wgt, bias, k, name):
-            oc, ic = wgt.shape[0], wgt.shape[1]
+        def conv(x, wgt, bias, name):
+            # Everything is derived from the loaded array shapes, so any
+            # ESP1 file (including slim distilled students) compiles as-is.
+            oc, ic, k = wgt.shape[0], wgt.shape[1], wgt.shape[2]
             pad = k // 2
             desc = G.MPSGraphConvolution2DOpDescriptor.descriptorWithStrideInX_strideInY_dilationRateInX_dilationRateInY_groups_paddingLeft_paddingRight_paddingTop_paddingBottom_paddingStyle_dataLayout_weightsLayout_(
                 1, 1, 1, 1, 1, pad, pad, pad, pad,
@@ -282,11 +291,11 @@ class MPSGraphInference:
             return graph.additionWithPrimaryTensor_secondaryTensor_name_(
                 y, const(bias.reshape(1, oc, 1, 1), 1, oc, 1, 1), name + "_b")
 
-        x = conv(inp, w1, b1, 5, "c1")
+        x = conv(inp, w1, b1, "c1")
         x = graph.tanhWithTensor_name_(x, "t1")
-        x = conv(x, w2, b2, 3, "c2")
+        x = conv(x, w2, b2, "c2")
         x = graph.tanhWithTensor_name_(x, "t2")
-        x = conv(x, w3, b3, 3, "c3")
+        x = conv(x, w3, b3, "c3")
         # PixelShuffle(3) == depthToSpace with pixel-shuffle ordering (NCHW).
         x = graph.depthToSpace2DTensor_widthAxis_heightAxis_depthAxis_blockSize_usePixelShuffleOrder_name_(
             x, 3, 2, 1, 3, True, "ps")
@@ -704,6 +713,65 @@ def responder(sock, sessions):
             st["req_diff_frames"] = st["req_raw_frames"] = 0
 
 
+# ---- optional frame dumping (training-data capture) ------------------------
+# Set FRAME_DUMP_DIR to save each NEW unique input frame as a grayscale PNG
+# into that directory — raw material for distillation training (see
+# native/tools/distill/). Deduped by content hash (in-memory + on-disk, so
+# restarts don't rewrite), rate-limited to FRAME_DUMP_MAX_PER_S. Zero cost
+# when the env var is unset: the hot path pays one falsy check.
+
+FRAME_DUMP_DIR = os.environ.get("FRAME_DUMP_DIR")
+FRAME_DUMP_MAX_PER_S = 20
+_dump_seen = set()
+_dump_stamps = []
+if FRAME_DUMP_DIR:
+    os.makedirs(FRAME_DUMP_DIR, exist_ok=True)
+
+
+def _gray_png_bytes(plane):
+    """Minimal 8-bit grayscale PNG encoder — stdlib only, so the server
+    gains no Pillow dependency for an opt-in debug feature."""
+    h, w = plane.shape
+    raw = b"".join(b"\x00" + plane[y].tobytes() for y in range(h))
+
+    def chunk(tag, body):
+        c = tag + body
+        return struct.pack(">I", len(body)) + c + struct.pack(">I", zlib.crc32(c))
+
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 0, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 6))
+            + chunk(b"IEND", b""))
+
+
+def maybe_dump_frame(luma, w, h):
+    """Called from the recv thread with the decoded input plane. The ring in
+    the session already dedups by frame_id; this dedups by CONTENT hash so
+    static scenes don't flood the dir, and rate-limits so scrolling scenes
+    don't either (PNG-encoding every frame at 60fps would also start eating
+    into the recv thread's budget)."""
+    now = time.monotonic()
+    while _dump_stamps and now - _dump_stamps[0] > 1.0:
+        _dump_stamps.pop(0)
+    if len(_dump_stamps) >= FRAME_DUMP_MAX_PER_S:
+        return
+    digest = hashlib.sha1(luma).hexdigest()[:16]
+    if digest in _dump_seen:
+        return
+    _dump_seen.add(digest)
+    path = os.path.join(FRAME_DUMP_DIR, f"frame_{w}x{h}_{digest}.png")
+    if os.path.exists(path):
+        return
+    _dump_stamps.append(now)
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(_gray_png_bytes(luma.reshape(h, w)))
+        os.replace(tmp, path)
+    except OSError as e:
+        print(f"[!] frame dump failed ({path}): {e}")
+
+
 def handle_request_complete(sock, sess, frame_id, flags, w, h, buf, uncomp_len,
                             ref_id, peer_id, zd, t_first, mc_dx=0, mc_dy=0):
     """Runs in the recv thread once every chunk of a request has landed:
@@ -747,6 +815,8 @@ def handle_request_complete(sock, sess, frame_id, flags, w, h, buf, uncomp_len,
     ring_put(sess["inputs"], frame_id, (luma.copy(), w, h))
     if frame_id > sess["latest_input_id"]:
         sess["latest_input_id"] = frame_id
+    if FRAME_DUMP_DIR:
+        maybe_dump_frame(luma, w, h)
 
     meta = {
         "addr": sess["addr"],
@@ -778,6 +848,9 @@ def main():
 
     backend = make_inference_backend(args.weights)
     print(f"[i] inference backend: {backend.name}, weights from {args.weights}")
+    if FRAME_DUMP_DIR:
+        print(f"[i] FRAME_DUMP_DIR set — dumping unique input frames to "
+              f"{FRAME_DUMP_DIR} (max {FRAME_DUMP_MAX_PER_S}/s)")
 
     threading.Thread(target=gpu_worker, args=(backend,), daemon=True).start()
     if backend.wants_keepalive:
