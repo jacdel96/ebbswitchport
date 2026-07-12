@@ -36,7 +36,8 @@ GAMES = {
     "yoshis_island": ["snes/01/smw2.html"],
     "super_metroid": ["snes/01/metroid3.html"],
     "zelda_alttp": ["snes/01/zelda3.html"],
-    "earthbound": ["snes/01/earthbound.html"],
+    "earthbound": ["snes/01/earthbound.html",
+                   "snes/01/mother2.html"],   # JP release, same game
     "final_fantasy_iv": ["snes/01/ff2.html"],       # US "Final Fantasy II"
     "final_fantasy_vi": ["snes/01/ff3.html"],       # US "Final Fantasy III"
     "dragon_quest_v": ["snes/01/dragonquest5.html"],
@@ -45,7 +46,8 @@ GAMES = {
     "dkc2": ["snes/01/dkc2.html"],
     "mega_man_x": ["snes/01/megamanx.html"],
     "super_mario_kart": ["snes/01/kart.html"],
-    "street_fighter_2_turbo": ["snes/01/SF2TSNES.html"],
+    "street_fighter_2_turbo": ["snes/01/SF2TSNES.html",
+                               "snes/01/SF2SNES.html"],  # original SF2 — art-identical
     "secret_of_mana": ["snes/01/mana.html"],
 }
 
@@ -83,7 +85,7 @@ def native_size(img):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--max-per-game", type=int, default=80)
+    ap.add_argument("--max-per-game", type=int, default=400)
     ap.add_argument("--games", help="comma-separated subset of game keys")
     args = ap.parse_args()
 

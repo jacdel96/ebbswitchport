@@ -125,11 +125,19 @@ def export_esp1(model, path):
 
 def load_luma(path):
     """BT.601 luma in [0,1] float32.  Handles RGB and grayscale PNGs."""
+    return load_luma_u8(path).astype(np.float32) / 255.0
+
+
+def load_luma_u8(path):
+    """BT.601 luma as uint8 — the in-RAM dataset format (4x smaller than
+    float32; ~2000 frames of float32 LR+HR is ~4.6GB, enough to draw the
+    macOS memory killer on a 16GB machine — learned the hard way)."""
     img = Image.open(path)
     if img.mode == "L":
-        return np.asarray(img, dtype=np.float32) / 255.0
+        return np.asarray(img, dtype=np.uint8)
     rgb = np.asarray(img.convert("RGB"), dtype=np.float32)
-    return (0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]) / 255.0
+    y = 0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]
+    return (y + 0.5).astype(np.uint8)
 
 
 def iter_pngs(d):
@@ -150,8 +158,8 @@ def load_pairs(frames_dir, targets_dir):
         if not os.path.exists(tpath):
             print(f"[data] skip {name}: no matching target")
             continue
-        lr = load_luma(os.path.join(frames_dir, name))
-        hr = load_luma(tpath)
+        lr = load_luma_u8(os.path.join(frames_dir, name))
+        hr = load_luma_u8(tpath)
         if hr.shape != (lr.shape[0] * SCALE, lr.shape[1] * SCALE):
             print(f"[data] skip {name}: target {hr.shape} is not {SCALE}x of {lr.shape}")
             continue
@@ -180,7 +188,9 @@ def sample_batch(pairs, rng, batch):
         k = int(rng.integers(4))
         if k:
             a, b = np.rot90(a, k), np.rot90(b, k)
-        lrs[i, 0], hrs[i, 0] = a, b
+        # dataset is stored uint8; convert per-crop (cheap at 64x64)
+        lrs[i, 0] = a.astype(np.float32) / 255.0
+        hrs[i, 0] = b.astype(np.float32) / 255.0
     return torch.from_numpy(lrs), torch.from_numpy(hrs)
 
 
@@ -195,9 +205,10 @@ def validate(model, pairs, device):
     model.eval()
     vals = []
     for _, lr, hr in pairs:
-        x = torch.from_numpy(lr[None, None]).to(device)
+        lrf = lr.astype(np.float32) / 255.0
+        x = torch.from_numpy(lrf[None, None]).to(device)
         y = model(x).clamp(0, 1)[0, 0].cpu().numpy()
-        vals.append(psnr(y, hr))
+        vals.append(psnr(y, hr.astype(np.float32) / 255.0))
     model.train()
     return float(np.mean(vals))
 
@@ -206,9 +217,10 @@ def bicubic_baseline(pairs):
     """PSNR of plain bicubic x3 vs the teacher target — the bar to beat."""
     vals = []
     for _, lr, hr in pairs:
-        im = Image.fromarray((lr * 255.0 + 0.5).astype(np.uint8), "L")
+        im = Image.fromarray(lr, "L")
         up = im.resize((lr.shape[1] * SCALE, lr.shape[0] * SCALE), Image.BICUBIC)
-        vals.append(psnr(np.asarray(up, dtype=np.float32) / 255.0, hr))
+        vals.append(psnr(np.asarray(up, dtype=np.float32) / 255.0,
+                         hr.astype(np.float32) / 255.0))
     return float(np.mean(vals))
 
 
