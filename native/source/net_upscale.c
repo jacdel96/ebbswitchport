@@ -67,6 +67,12 @@ static const uint8_t NET_MAGIC[4] = { 'E', 'B', 'U', '2' };
 static Thread g_thread;         // writer
 static Thread g_reader_thread;
 static Mutex g_lock;
+// Condvars (paired with g_lock) replacing the old 1ms sleep-polls: the game
+// thread's result wait and the writer's pickup of newly-submitted frames
+// each burned up to ~1ms of pure scheduling quantization per frame — dead
+// time on the serial path, recovered by waking the exact waiter instantly.
+static CondVar g_result_cv;    // signaled when a new result is published
+static CondVar g_send_cv;      // signaled when a frame is submitted
 static bool g_run = false;      // background thread's run flag
 static bool g_ready = false;    // net_upscale_init succeeded, thread is alive
 static bool g_connected = false; // handshake completed, frames flowing
@@ -505,6 +511,7 @@ static void reader_deliver(const InflightEntry *entry, const uint8_t *out_luma,
     g_result_generation++;
     g_last_result_hash = entry->hash;
     cache_insert(entry->hash, entry->w, entry->h, ow, oh, out_luma);
+    condvarWakeAll(&g_result_cv);
     mutexUnlock(&g_lock);
 }
 
@@ -912,7 +919,12 @@ static void net_thread_func(void *arg) {
                     send(sock, ping, sizeof(ping), 0);
                     last_tx_ns = now_ns;
                 }
-                svcSleepThread(1000000ULL);  // 1ms idle poll
+                // Woken instantly by submit; bounded so the alive check,
+                // PING pacing, and slot expiry still run while idle.
+                mutexLock(&g_lock);
+                if (!g_send_pending)
+                    condvarWaitTimeout(&g_send_cv, &g_lock, 2000000ULL);
+                mutexUnlock(&g_lock);
                 continue;
             }
 
@@ -1030,6 +1042,8 @@ bool net_upscale_init(const char *host_port, const char *pairing_code, bool comp
 
     mutexInit(&g_lock);
     mutexInit(&g_inflight_lock);
+    condvarInit(&g_result_cv);
+    condvarInit(&g_send_cv);
     g_connected = false;
     g_have_result = false;
     g_send_pending = false;
@@ -1082,6 +1096,7 @@ void net_upscale_submit_frame(const uint8_t *luma, unsigned w, unsigned h) {
     g_send_w = w; g_send_h = h;
     g_pending_hash = hash;
     g_send_pending = true;
+    condvarWakeAll(&g_send_cv);
     mutexUnlock(&g_lock);
 }
 
@@ -1134,13 +1149,13 @@ bool net_upscale_submit_and_wait(const uint8_t *luma, unsigned w, unsigned h,
     g_send_w = w; g_send_h = h;
     g_pending_hash = hash;
     g_send_pending = true;
+    condvarWakeAll(&g_send_cv);
     unsigned last_checked_gen = g_result_generation;
     mutexUnlock(&g_lock);
 
-    for (unsigned waited_ms = 0; waited_ms < timeout_ms; waited_ms++) {
-        svcSleepThread(1000000ULL);  // 1ms
-
-        mutexLock(&g_lock);
+    u64 deadline = armGetSystemTick() + armNsToTicks((u64)timeout_ms * 1000000ULL);
+    mutexLock(&g_lock);
+    for (;;) {
         if (g_have_result && g_result_generation != last_checked_gen) {
             last_checked_gen = g_result_generation;
             if (g_last_result_hash == hash) {
@@ -1152,8 +1167,14 @@ bool net_upscale_submit_and_wait(const uint8_t *luma, unsigned w, unsigned h,
             }
             // Someone else's (stale/abandoned) result — not ours, keep waiting.
         }
-        mutexUnlock(&g_lock);
+        s64 remaining = (s64)(deadline - armGetSystemTick());
+        if (remaining <= 0) break;
+        // Woken the instant the reader publishes (or spuriously — the loop
+        // re-checks); the old 1ms sleep-poll added up to ~1ms of dead time
+        // to every single round trip.
+        condvarWaitTimeout(&g_result_cv, &g_lock, armTicksToNs((u64)remaining));
     }
+    mutexUnlock(&g_lock);
     return false;
 }
 

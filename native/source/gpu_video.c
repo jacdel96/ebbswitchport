@@ -155,6 +155,15 @@ static bool g_network_have_output = false;
 static bool g_network_pending = false;
 static unsigned g_network_pending_w = 0, g_network_pending_h = 0;
 static DkMemBlock g_networkScratch[N_PARITY];  // CPU-visible RGBA8 recombine target
+                                                // (CPU-recombine fallback path only)
+// GPU-side recombine (recombine_comp.glsl): the CPU only memcpys the raw
+// 3x luma plane into g_lumaScratch and the shader does chroma sampling +
+// YCbCr recombine straight into g_espcnOutImage — removing the ~2-4ms
+// integer recombine from the serial frame budget entirely. Falls back to
+// the CPU path (g_networkScratch + CopyBufferToImage) when unavailable.
+static DkShader g_recombineShader;
+static DkMemBlock g_lumaScratch[N_PARITY];     // CPU-visible packed luma bytes
+static bool g_recombine_gpu_ok = false;
 
 static DkMemBlock g_cmdbufMemBlock;
 static DkCmdBuf g_cmdbuf;
@@ -250,6 +259,7 @@ static void teardown(void) {
         if (g_hudScratch[i]) dkMemBlockDestroy(g_hudScratch[i]);
         if (g_gameScratch[i]) dkMemBlockDestroy(g_gameScratch[i]);
         if (g_networkScratch[i]) dkMemBlockDestroy(g_networkScratch[i]);
+        if (g_lumaScratch[i]) dkMemBlockDestroy(g_lumaScratch[i]);
     }
     if (g_overlayImgMem) dkMemBlockDestroy(g_overlayImgMem);
     if (g_hudImgMem) dkMemBlockDestroy(g_hudImgMem);
@@ -276,6 +286,7 @@ static void teardown(void) {
     memset(g_hudScratch, 0, sizeof(g_hudScratch));
     memset(g_overlayScratch, 0, sizeof(g_overlayScratch));
     memset(g_networkScratch, 0, sizeof(g_networkScratch));
+    memset(g_lumaScratch, 0, sizeof(g_lumaScratch));
     g_descMemBlock = NULL;
     g_cmdbufMemBlock = NULL;
     g_cmdbuf = NULL;
@@ -294,6 +305,7 @@ bool gpu_video_init(NWindow *win) {
     memset(g_hudScratch, 0, sizeof(g_hudScratch));
     memset(g_overlayScratch, 0, sizeof(g_overlayScratch));
     memset(g_networkScratch, 0, sizeof(g_networkScratch));
+    memset(g_lumaScratch, 0, sizeof(g_lumaScratch));
     g_descMemBlock = NULL;
     g_cmdbufMemBlock = NULL;
     g_cmdbuf = NULL;
@@ -310,6 +322,7 @@ bool gpu_video_init(NWindow *win) {
     g_network_enabled = false;
     g_network_have_output = false;
     g_network_pending = false;
+    g_recombine_gpu_ok = false;
     g_win = win;
     resolution_for_mode(&g_fb_w, &g_fb_h);  // start at whatever mode we're already in
     compute_dst_layout();
@@ -396,7 +409,11 @@ bool gpu_video_init(NWindow *win) {
         g_hudScratch[i] = make_memblock(hudScratchSize, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
         g_overlayScratch[i] = make_memblock(overlayScratchSize, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
         g_networkScratch[i] = make_memblock(networkScratchSize, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
-        if (!g_gameScratch[i] || !g_hudScratch[i] || !g_overlayScratch[i] || !g_networkScratch[i]) { teardown(); return false; }
+        // Packed luma bytes for the GPU recombine path — quarter the size of
+        // the RGBA scratch, and the only per-frame CPU work that path keeps.
+        g_lumaScratch[i] = make_memblock(networkScratchSize / 4, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
+        if (!g_gameScratch[i] || !g_hudScratch[i] || !g_overlayScratch[i] ||
+            !g_networkScratch[i] || !g_lumaScratch[i]) { teardown(); return false; }
     }
 
     // Sampler: nearest filtering (the default) is exactly the CPU path's
@@ -412,6 +429,13 @@ bool gpu_video_init(NWindow *win) {
     // Experimental AI upscale — optional, see try_init_espcn's comment. Its
     // absence is not a gpu_video_init failure.
     g_espcn_available = try_init_espcn();
+
+    // GPU-side network recombine — piggybacks on the ESPCN resources
+    // (g_espcnOutImage as the write target, g_espcnDimsUbo for dims), so
+    // it's only attempted when those exist. Failure just leaves the CPU
+    // recombine fallback in charge; never fatal.
+    g_recombine_gpu_ok = g_espcn_available &&
+                          load_shader(&g_recombineShader, "romfs:/shaders/recombine_comp.dksh");
 
     // Command buffer, reused (cleared + re-recorded) every present().
     g_cmdbufMemBlock = make_memblock(CMD_MEM_SIZE, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
@@ -658,6 +682,20 @@ void gpu_video_upload_network_result(const uint8_t *luma, unsigned w, unsigned h
     if (g_game_w == 0 || w != g_game_w * ESPCN_SCALE || h != g_game_h * ESPCN_SCALE) return;
     if (w > ESPCN_MAX_W * ESPCN_SCALE || h > ESPCN_MAX_H * ESPCN_SCALE) return;
 
+    if (g_recombine_gpu_ok) {
+        // GPU recombine path: the CPU's whole job is one 516KB memcpy; the
+        // chroma sampling + YCbCr math runs as recombine_comp.glsl inside
+        // the present command list. This is what finally removes the
+        // recombine from the serial frame budget (the CPU version below —
+        // already 30x faster than its float ancestor — still cost ~2-4ms
+        // of every frame that displayed a new network result).
+        memcpy(dkMemBlockGetCpuAddr(g_lumaScratch[g_parity]), luma, (size_t)w * h);
+        g_network_pending_w = w;
+        g_network_pending_h = h;
+        g_network_pending = true;
+        return;
+    }
+
     const uint32_t *src = (const uint32_t *)dkMemBlockGetCpuAddr(g_gameScratch[g_parity]);
     uint32_t *dst = (uint32_t *)dkMemBlockGetCpuAddr(g_networkScratch[g_parity]);
 
@@ -821,10 +859,11 @@ void gpu_video_present(void) {
         DkImageRect rect = { 0, 0, 0, g_pending_game_w, g_pending_game_h, 1 };
         dkCmdBufCopyBufferToImage(g_cmdbuf, &src, &view, &rect, 0);
     }
-    if (g_network_pending) {
-        // Same output slot the local ESPCN compute path writes — see
-        // gpu_video.h. Uploaded via the CPU-recombined buffer instead of a
-        // compute dispatch.
+    if (g_network_pending && !g_recombine_gpu_ok) {
+        // CPU-recombine fallback: same output slot the local ESPCN compute
+        // path writes — see gpu_video.h. Uploaded via the CPU-recombined
+        // RGBA buffer. (The GPU-recombine path is handled after the upload
+        // barrier below, since its dispatch samples the game texture.)
         DkCopyBuf src = { dkMemBlockGetGpuAddr(g_networkScratch[g_parity]), 0, 0 };
         DkImageView view;
         dkImageViewDefaults(&view, &g_espcnOutImage);
@@ -848,6 +887,30 @@ void gpu_video_present(void) {
         dkCmdBufCopyBufferToImage(g_cmdbuf, &src, &view, &rect, 0);
     }
     if (any_pending) dkCmdBufBarrier(g_cmdbuf, DkBarrier_Full, DkInvalidateFlags_Image);
+
+    if (g_network_pending && g_recombine_gpu_ok) {
+        // GPU recombine (recombine_comp.glsl): consumes the freshly-uploaded
+        // game frame for chroma — hence AFTER the upload barrier above — and
+        // the raw luma SSBO, writing g_espcnOutImage for the game-quad draw
+        // below to sample. Same binding/barrier pattern as run_espcn_upscale.
+        struct { uint32_t w, h; } dims = { g_game_w, g_game_h };
+        memcpy(dkMemBlockGetCpuAddr(g_espcnDimsUbo), &dims, sizeof(dims));
+        uint32_t lumaBytes = ((uint32_t)g_network_pending_w * g_network_pending_h + 3u) & ~3u;
+        DkShader const *rc[] = { &g_recombineShader };
+        dkCmdBufBindShaders(g_cmdbuf, DkStageFlag_Compute, rc, 1);
+        dkCmdBufBindTexture(g_cmdbuf, DkStage_Compute, 0, dkMakeTextureHandle(IMG_GAME, SAMPLER_SLOT));
+        dkCmdBufBindImage(g_cmdbuf, DkStage_Compute, 0, dkMakeImageHandle(IMG_ESPCN_OUT));
+        dkCmdBufBindUniformBuffer(g_cmdbuf, DkStage_Compute, 0,
+                                   dkMemBlockGetGpuAddr(g_espcnDimsUbo), DK_UNIFORM_BUF_ALIGNMENT);
+        dkCmdBufBindStorageBuffer(g_cmdbuf, DkStage_Compute, 0,
+                                   dkMemBlockGetGpuAddr(g_lumaScratch[g_parity]), lumaBytes);
+        dkCmdBufDispatchCompute(g_cmdbuf, (g_game_w + 7) / 8, (g_game_h + 7) / 8, 1);
+        // The very next consumer is the game-quad draw sampling the image —
+        // same combined flags run_espcn_upscale documents for this pattern.
+        dkCmdBufBarrier(g_cmdbuf, DkBarrier_Full, DkInvalidateFlags_L2Cache | DkInvalidateFlags_Image);
+        g_network_have_output = true;
+        g_network_pending = false;
+    }
 
     DkImageView fbView;
     dkImageViewDefaults(&fbView, &g_fbImages[slot]);
