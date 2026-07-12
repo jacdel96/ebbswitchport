@@ -4,6 +4,11 @@ roms/
 *.smc
 *.nro
 
+# Experimental AI-upscale weights (native/source/shaders/espcn*_comp.glsl) —
+# unresolved licensing on the source checkpoint, see the research memo.
+# Local-only until that's resolved; never commit or ship.
+native/romfs/ai/
+
 # Native NRO build artifacts (the .nro embeds the ROM)
 native/build/
 native/build-out/
@@ -15,7 +20,13 @@ native/.icon.jpg
 native/vendor/snes9x/
 native/lib/*.a
 
+# SR training data (map rips / frames / teacher outputs / selections) — never commit
+training_data/
+
 # OS noise
 .DS_Store
 .venv/
 __pycache__/
+native/netbench/build/
+native/netbench/*.elf
+native/netbench/*.nacp

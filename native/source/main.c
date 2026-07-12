@@ -15,9 +15,11 @@
 #include "audio.h"
 #include "gpu_video.h"
 #include "libretro.h"
+#include "net_upscale.h"
 #include "osd.h"
 #include "pixfmt.h"
 #include "save_io.h"
+#include "telemetry.h"
 #include "settings.h"
 
 #ifndef GAME_ID
@@ -53,8 +55,9 @@ static u32 *g_frame = NULL;
 #define SLOT_COUNT 10            // manual slots 0..9
 #define LOAD_COUNT (SLOT_COUNT + 2)  // + auto1 + auto10
 #define MAIN_COUNT 6             // Resume/Save/Load/Reset/Settings/Exit
-#define SETTINGS_COUNT 7         // Hardware Accel/Audio Buffer/Show HUD/Dynamic Overclock/
-                                  // OC Trigger/OC Boost/CRT Mode
+#define SETTINGS_COUNT 11        // Hardware Accel/Audio Buffer/Show HUD/Dynamic Overclock/
+                                  // OC Trigger/OC Boost/CRT Mode/AI Upscale/
+                                  // Network Setup/Network Upscale/Network Compression
 static bool g_menu_open = false;
 static int g_menu_level = 0;
 static int g_menu_sel = 0;
@@ -175,6 +178,71 @@ static void run_timing_tick(unsigned us) {
     g_run_us_window_max = 0;
 }
 
+// Same windowing as run_timing_tick, for the experimental AI (ESPCN) upscale
+// pass — see gpu_video_get_ai_upscale_us's comment. Only ticked on frames it
+// actually ran, so the average reflects real dispatch cost, not diluted by
+// frames where it was skipped (menu closed vs open, resolution out of range).
+static unsigned long long g_ai_us_sum = 0;
+static unsigned g_ai_us_count = 0;
+static unsigned g_ai_us_window_max = 0;
+static unsigned g_ai_avg_us = 0;
+static unsigned g_ai_max_us = 0;
+
+static void ai_timing_tick(unsigned us) {
+    g_ai_us_sum += us;
+    g_ai_us_count++;
+    if (us > g_ai_us_window_max) g_ai_us_window_max = us;
+    if (g_ai_us_count < 30) return;
+    g_ai_avg_us = (unsigned)(g_ai_us_sum / g_ai_us_count);
+    g_ai_max_us = g_ai_us_window_max;
+    g_ai_us_sum = 0;
+    g_ai_us_count = 0;
+    g_ai_us_window_max = 0;
+}
+
+// Same windowing again, for the experimental network AI-upscale offload
+// (see net_upscale.h) — only ticked on frames where a new result actually
+// arrived, mirroring ai_timing_tick's reasoning.
+static unsigned long long g_net_us_sum = 0;
+static unsigned g_net_us_count = 0;
+static unsigned g_net_us_window_max = 0;
+static unsigned g_net_avg_us = 0;
+static unsigned g_net_max_us = 0;
+
+static void net_timing_tick(unsigned us) {
+    g_net_us_sum += us;
+    g_net_us_count++;
+    if (us > g_net_us_window_max) g_net_us_window_max = us;
+    if (g_net_us_count < 30) return;
+    g_net_avg_us = (unsigned)(g_net_us_sum / g_net_us_count);
+    g_net_max_us = g_net_us_window_max;
+    g_net_us_sum = 0;
+    g_net_us_count = 0;
+    g_net_us_window_max = 0;
+}
+
+// present()-loop timing — the display path's cost (recombine, uploads, GPU
+// present, vsync wait), which RUN and NET are both blind to. Added while
+// chasing "HUD says 6fps with NET at 18ms": the CPU-side network-result
+// recombine lived here, invisible to every other HUD metric.
+static unsigned long long g_pres_us_sum = 0;
+static unsigned g_pres_us_count = 0;
+static unsigned g_pres_us_window_max = 0;
+static unsigned g_pres_avg_us = 0;
+static unsigned g_pres_max_us = 0;
+
+static void pres_timing_tick(unsigned us) {
+    g_pres_us_sum += us;
+    g_pres_us_count++;
+    if (us > g_pres_us_window_max) g_pres_us_window_max = us;
+    if (g_pres_us_count < 60) return;
+    g_pres_avg_us = (unsigned)(g_pres_us_sum / g_pres_us_count);
+    g_pres_max_us = g_pres_us_window_max;
+    g_pres_us_sum = 0;
+    g_pres_us_count = 0;
+    g_pres_us_window_max = 0;
+}
+
 // --- rendering backend selection ---------------------------------------------
 // GPU (deko3d) path state — populated only when g_use_gpu is true.
 static bool g_use_gpu = false;
@@ -184,6 +252,15 @@ static unsigned g_native_w = 0, g_native_h = 0;
 static u32 *g_menu_frame = NULL;        // 1280x720 backdrop for the GPU-path menu overlay
 static u32 *g_hud_frame = NULL;         // small HUD_W x HUD_H panel for the GPU-path HUD
 static PixelLut g_pixlut = {0};         // shared 16bpp->RGBA8 LUT (CPU and GPU paths)
+
+// --- network AI-upscale state (see net_upscale.h) -----------------------------
+static bool g_net_initialized = false;  // net_upscale_init has been called this session
+static uint8_t *g_luma_buf = NULL;      // scratch: luma extracted from g_native_frame
+static unsigned g_luma_cap = 0;
+static uint64_t g_net_last_upload_hash = 0; // result hash last recombined+uploaded —
+                                             // see the pixels-changed gate in present()
+static unsigned g_net_last_generation = 0;  // last net_upscale_get_result_generation()
+                                             // we ticked timing for — see net_timing_tick
 
 // --- libretro callbacks ------------------------------------------------------
 static void video_refresh(const void *data, unsigned width, unsigned height,
@@ -202,6 +279,46 @@ static void video_refresh(const void *data, unsigned width, unsigned height,
         pixfmt_convert_to_rgba8(g_native_frame, data, width, height, pitch, g_px_fmt, &g_pixlut);
         g_native_w = width; g_native_h = height;
         gpu_video_upload_frame(g_native_frame, width, height);
+
+        if (g_settings.net_upscale && g_net_initialized) {
+            // Luma-only (see net_upscale.h) — same convention as espcn1_comp.glsl's
+            // luma extraction (matches the network's own model, which was only ever
+            // trained on the Y channel).
+            unsigned need = width * height;
+            if (need > g_luma_cap) {
+                free(g_luma_buf);
+                g_luma_buf = malloc(need);
+                g_luma_cap = need;
+            }
+            if (g_luma_buf) {
+                for (unsigned i = 0; i < need; i++) {
+                    u32 px = g_native_frame[i];
+                    float r = (float)(px & 0xFF), g = (float)((px >> 8) & 0xFF), b = (float)((px >> 16) & 0xFF);
+                    float y = 0.299f * r + 0.587f * g + 0.114f * b;
+                    g_luma_buf[i] = (uint8_t)(y < 0.0f ? 0.0f : (y > 255.0f ? 255.0f : y));
+                }
+                // Directional input predicts camera-scroll direction — seeds
+                // the network thread's request-side motion compensation
+                // (see net_upscale_hint_input's comment; purely advisory).
+                int dir_x = ((g_held & (HidNpadButton_Right | HidNpadButton_StickLRight)) ? 1 : 0)
+                          - ((g_held & (HidNpadButton_Left | HidNpadButton_StickLLeft)) ? 1 : 0);
+                int dir_y = ((g_held & (HidNpadButton_Down | HidNpadButton_StickLDown)) ? 1 : 0)
+                          - ((g_held & (HidNpadButton_Up | HidNpadButton_StickLUp)) ? 1 : 0);
+                net_upscale_hint_input(dir_x, dir_y);
+                // Blocks retro_run() itself (this is called synchronously
+                // from inside it) on this frame's own upscaled result,
+                // rather than treating the network round trip as background
+                // work the game never waits for — Network Upscale is on, so
+                // every displayed frame should show ITS OWN result, not
+                // whatever previous round trip happened to land most
+                // recently. Bounded at 60ms (~2x the ~26ms measured wired
+                // round trip, room for jitter without stalling gameplay) —
+                // on timeout this just fails soft like everything else here:
+                // present() keeps showing the last successful result via its
+                // own net_upscale_get_result() poll, nothing hangs or crashes.
+                net_upscale_submit_and_wait(g_luma_buf, width, height, 60, NULL, NULL, NULL);
+            }
+        }
         return;
     }
 
@@ -431,6 +548,30 @@ static bool state_exists(const char *ext) {
     return false;
 }
 
+// Shows the on-screen keyboard with the given header/guide/initial text;
+// returns true and fills `out` (up to out_size-1 bytes + NUL) if the user
+// confirmed, false (out left untouched) if they backed out. Blocks until the
+// applet closes — fine here since it's only ever invoked from the paused
+// Settings menu, never during gameplay.
+static bool text_entry(const char *header, const char *guide, const char *initial,
+                        char *out, size_t out_size) {
+    SwkbdConfig kbd;
+    if (R_FAILED(swkbdCreate(&kbd, 0))) return false;
+    swkbdConfigMakePresetDefault(&kbd);
+    swkbdConfigSetHeaderText(&kbd, header);
+    swkbdConfigSetGuideText(&kbd, guide);
+    if (initial && initial[0]) swkbdConfigSetInitialText(&kbd, initial);
+    swkbdConfigSetStringLenMax(&kbd, (u32)(out_size - 1));
+
+    char buf[64];
+    bool ok = R_SUCCEEDED(swkbdShow(&kbd, buf, sizeof(buf)));
+    swkbdClose(&kbd);
+    if (!ok) return false;
+    strncpy(out, buf, out_size - 1);
+    out[out_size - 1] = '\0';
+    return true;
+}
+
 // --- settings menu row helpers ------------------------------------------------
 // Adjusts the settings row `sel` by one step (dir = +1/-1), applies it live
 // where that's safe (audio buffer, HUD), and persists immediately.
@@ -464,6 +605,63 @@ static void settings_adjust(int sel, int dir) {
     } else if (sel == 6) {
         g_settings.crt_mode = !g_settings.crt_mode;        // live (GPU path only)
         gpu_video_set_crt(g_settings.crt_mode);
+    } else if (sel == 7) {
+        // Refuse to flip on when it can't actually run — see the Settings
+        // row's "N/A" text for why. Avoids a setting that reads "On" while
+        // silently doing nothing (or, worse, reading "On" from a save file
+        // on a build/device where it never had a chance to become available).
+        if (g_use_gpu && gpu_video_ai_upscale_available()) {
+            g_settings.ai_upscale = !g_settings.ai_upscale;
+            gpu_video_set_ai_upscale(g_settings.ai_upscale);
+            // Mutually exclusive with the network path — both write the same
+            // GPU output slot (see gpu_video.h).
+            if (g_settings.ai_upscale && g_settings.net_upscale) {
+                g_settings.net_upscale = false;
+                gpu_video_set_network_upscale(false);
+            }
+        }
+    } else if (sel == 8) {
+        // Network Setup: enter the laptop's "ip:port" and the shared pairing
+        // code (see native/tools/net_upscale_server.py). Only takes effect
+        // the next time Network Upscale is turned on — doesn't reconnect an
+        // already-running session.
+        char host[64];
+        if (text_entry("Laptop address", "e.g. 192.168.1.42:9876",
+                        g_settings.net_host, host, sizeof(host))) {
+            strncpy(g_settings.net_host, host, sizeof(g_settings.net_host) - 1);
+            g_settings.net_host[sizeof(g_settings.net_host) - 1] = '\0';
+        }
+        char code[64];
+        if (text_entry("Pairing code", "must match the laptop's --pairing-code",
+                        g_settings.net_pairing_code, code, sizeof(code))) {
+            strncpy(g_settings.net_pairing_code, code, sizeof(g_settings.net_pairing_code) - 1);
+            g_settings.net_pairing_code[sizeof(g_settings.net_pairing_code) - 1] = '\0';
+        }
+    } else if (sel == 9) {
+        // Refuse to enable without a configured host/pairing code, and
+        // mutually exclusive with the local path (see sel==7's comment).
+        if (g_use_gpu && g_settings.net_host[0] && g_settings.net_pairing_code[0]) {
+            g_settings.net_upscale = !g_settings.net_upscale;
+            if (g_settings.net_upscale) {
+                if (!g_net_initialized) {
+                    g_net_initialized = net_upscale_init(g_settings.net_host, g_settings.net_pairing_code,
+                                                          g_settings.net_compression);
+                }
+                if (g_settings.ai_upscale) {
+                    g_settings.ai_upscale = false;
+                    gpu_video_set_ai_upscale(false);
+                }
+            }
+            gpu_video_set_network_upscale(g_settings.net_upscale && g_net_initialized);
+        }
+    } else if (sel == 10) {
+        // net_upscale_set_compression, not net_upscale_init: init only runs
+        // once per session (see sel==9's !g_net_initialized guard). The
+        // setter force-reconnects a live session whose negotiated value
+        // differs, so this toggle takes real effect within ~1s — see
+        // net_upscale.h for why anything less reliable half-applies.
+        g_settings.net_compression = !g_settings.net_compression;
+        if (g_net_initialized) net_upscale_set_compression(g_settings.net_compression);
     }
     settings_save(&g_settings);
 }
@@ -490,7 +688,7 @@ static void draw_menu(u32 *fb, u32 stride) {
     ty += lh + 10;
 
     for (int i = 0; i < count; i++) {
-        char line[48];
+        char line[96];  // wide enough for a 16-char padded label + a 63-char host string
         if (g_menu_level == 0) {
             const char *m[] = {"Resume", "Save", "Load", "Reset", "Settings", "Exit"};
             snprintf(line, sizeof(line), "%s", m[i]);
@@ -507,8 +705,24 @@ static void draw_menu(u32 *fb, u32 stride) {
                                        g_settings.overclock_trigger_dupes);
             else if (i == 5) snprintf(line, sizeof(line), "%-16s %u frames", "OC Boost",
                                        g_settings.overclock_boost_frames);
-            else snprintf(line, sizeof(line), "%-16s %s", "CRT Mode",
-                          g_settings.crt_mode ? "On" : "Off");
+            else if (i == 6) snprintf(line, sizeof(line), "%-16s %s", "CRT Mode",
+                                       g_settings.crt_mode ? "On" : "Off");
+            else if (i == 7 && !g_use_gpu) snprintf(line, sizeof(line), "%-16s %s", "AI Upscale",
+                                            "N/A (needs GPU accel)");
+            else if (i == 7 && !gpu_video_ai_upscale_available()) snprintf(line, sizeof(line), "%-16s %s",
+                                            "AI Upscale", "N/A (no weights)");
+            else if (i == 7) snprintf(line, sizeof(line), "%-16s %s", "AI Upscale",
+                          g_settings.ai_upscale ? "On" : "Off");
+            else if (i == 8) snprintf(line, sizeof(line), "%-16s %.20s", "Network Setup",
+                          g_settings.net_host[0] ? g_settings.net_host : "(not configured)");
+            else if (i == 9 && !g_use_gpu) snprintf(line, sizeof(line), "%-16s %s",
+                                            "Network Upscale", "N/A (needs GPU accel)");
+            else if (i == 9 && (!g_settings.net_host[0] || !g_settings.net_pairing_code[0]))
+                snprintf(line, sizeof(line), "%-16s %s", "Network Upscale", "N/A (run Network Setup)");
+            else if (i == 9) snprintf(line, sizeof(line), "%-16s %s", "Network Upscale",
+                          g_settings.net_upscale ? (net_upscale_connected() ? "On" : "On (connecting)") : "Off");
+            else if (i == 10) snprintf(line, sizeof(line), "%-16s %s", "Net Compression",
+                          g_settings.net_compression ? "On" : "Off");
         } else {
             char ext[16];
             const char *name;
@@ -563,7 +777,9 @@ static void draw_menu(u32 *fb, u32 stride) {
 static void draw_hud(u32 *fb, u32 stride, u32 canvas_h, int x0, int y0) {
     AudioStats as;
     audio_stats(&as);
-    char line1[80], line2[48];
+    char line1[80], line2[80], line3[48];
+    bool ai_active = g_use_gpu && gpu_video_ai_upscale_active();
+    bool net_active = g_use_gpu && g_settings.net_upscale && g_net_initialized;
     // g_use_gpu reflects the backend actually running this session (settings
     // hw_accel is only the *request* — gpu_video_init may have failed and
     // silently fallen back to CPU, see main()'s init), not just the setting.
@@ -576,18 +792,41 @@ static void draw_hud(u32 *fb, u32 stride, u32 canvas_h, int x0, int y0) {
              g_fps_x10 / 10, g_fps_x10 % 10, (as.ring_frames + as.inflight_frames) / 48,
              g_lag_pct, g_overclock_boost ? "  OC" : "");
     // Direct retro_run() timing — see run_timing_tick's comment for why this
-    // exists alongside (and is more trustworthy than) LAG %.
+    // exists alongside (and is more trustworthy than) LAG %. PRES is the
+    // display path's own cost (recombine/uploads/present/vsync), which RUN
+    // and NET are both blind to — FPS ~= 1000 / (RUN + PRES).
     unsigned avg_x10 = g_run_avg_us / 100, max_x10 = g_run_max_us / 100;  // tenths of a ms
-    snprintf(line2, sizeof(line2), "RUN avg %u.%ums  max %u.%ums",
-             avg_x10 / 10, avg_x10 % 10, max_x10 / 10, max_x10 % 10);
+    unsigned pres_x10 = g_pres_avg_us / 100, presmax_x10 = g_pres_max_us / 100;
+    snprintf(line2, sizeof(line2), "RUN %u.%u/%u.%ums  PRES %u.%u/%u.%ums",
+             avg_x10 / 10, avg_x10 % 10, max_x10 / 10, max_x10 % 10,
+             pres_x10 / 10, pres_x10 % 10, presmax_x10 / 10, presmax_x10 % 10);
+    // Experimental AI (ESPCN) upscale timing — only shown while it's actually
+    // running (GPU path, weights present, enabled, resolution in range).
+    // Mutually exclusive with the network path (see settings_adjust), so at
+    // most one of these two ever applies.
+    if (ai_active) {
+        unsigned ai_avg_x10 = g_ai_avg_us / 100, ai_max_x10 = g_ai_max_us / 100;
+        snprintf(line3, sizeof(line3), "AI avg %u.%ums  max %u.%ums",
+                 ai_avg_x10 / 10, ai_avg_x10 % 10, ai_max_x10 / 10, ai_max_x10 % 10);
+    } else if (net_active) {
+        unsigned net_avg_x10 = g_net_avg_us / 100, net_max_x10 = g_net_max_us / 100;
+        snprintf(line3, sizeof(line3), "NET avg %u.%ums  max %u.%ums",
+                 net_avg_x10 / 10, net_avg_x10 % 10, net_max_x10 / 10, net_max_x10 % 10);
+    }
 
+    bool line3_active = ai_active || net_active;
     const int scale = 2;
     int lh = 8 * scale + 6;
     int w1 = osd_text_w(line1, scale), w2 = osd_text_w(line2, scale);
-    int w = (w1 > w2 ? w1 : w2) + 24, h = lh * 2 + 12;
+    int w3 = line3_active ? osd_text_w(line3, scale) : 0;
+    int wmax = w1 > w2 ? w1 : w2;
+    if (w3 > wmax) wmax = w3;
+    int lines = line3_active ? 3 : 2;
+    int w = wmax + 24, h = lh * lines + 12;
     osd_rect(fb, stride, canvas_h, x0, y0, w, h, 0xFF181818u);
     osd_text(fb, stride, canvas_h, x0 + 12, y0 + 6, 0xFFFFFFFFu, scale, line1);
     osd_text(fb, stride, canvas_h, x0 + 12, y0 + 6 + lh, 0xFFFFFFFFu, scale, line2);
+    if (line3_active) osd_text(fb, stride, canvas_h, x0 + 12, y0 + 6 + lh * 2, 0xFFFFFFFFu, scale, line3);
 }
 
 // GPU-path only: builds the paused-menu backdrop (native-res frame nearest-
@@ -624,7 +863,32 @@ static void present(void) {
                 gpu_video_set_hud(NULL, 0, 0);
             }
         }
+        if (g_settings.net_upscale && g_net_initialized) {
+            const uint8_t *result_luma;
+            unsigned rw, rh;
+            if (net_upscale_get_result(&result_luma, &rw, &rh)) {
+                // Only recombine+upload when the result's PIXELS changed.
+                // The unconditional version re-ran the full CPU recombine on
+                // the same latched result every single present(); gating on
+                // the generation counter alone still re-ran it on every
+                // cache hit (generation bumps, pixels identical — standing
+                // still, that's every frame). The uploaded texture persists,
+                // so skipping is free correctness-wise.
+                unsigned gen = net_upscale_get_result_generation();
+                if (gen != g_net_last_generation) {
+                    g_net_last_generation = gen;
+                    uint64_t rhash = net_upscale_get_result_hash();
+                    if (rhash != g_net_last_upload_hash) {
+                        g_net_last_upload_hash = rhash;
+                        gpu_video_upload_network_result(result_luma, rw, rh);
+                    }
+                    net_timing_tick(net_upscale_get_last_rtt_us());
+                }
+            }
+        }
+        bool ai_ran = gpu_video_ai_upscale_active();
         gpu_video_present();
+        if (ai_ran) ai_timing_tick(gpu_video_get_ai_upscale_us());
         return;
     }
     u32 stride;
@@ -691,6 +955,7 @@ int main(int argc, char **argv) {
 
     romfsInit();
     save_io_init();
+    telemetry_init();
 
     settings_load(&g_settings);
     audio_preset_sync();
@@ -707,6 +972,7 @@ int main(int argc, char **argv) {
         g_menu_frame = malloc((size_t)FB_W * FB_H * sizeof(u32));
         g_hud_frame = malloc((size_t)HUD_W * HUD_H * sizeof(u32));
         gpu_video_set_crt(g_settings.crt_mode);
+        gpu_video_set_ai_upscale(g_settings.ai_upscale);
     } else {
         framebufferCreate(&g_fb, win, FB_W, FB_H, PIXEL_FORMAT_RGBA_8888, 2);
         framebufferMakeLinear(&g_fb);
@@ -758,11 +1024,25 @@ int main(int argc, char **argv) {
             run_timing_tick((unsigned)(armTicksToNs(armGetSystemTick() - run_t0) / 1000));
             fps_tick();                 // only counts real gameplay frames
             frame++;
+            if (frame % 120 == 0)                       // stats to SD ~every 2-5s
+                telemetry_printf("fps %u.%u run %u.%u/%u.%u pres %u.%u/%u.%u net %u.%u/%u.%u lag %u%%",
+                                  g_fps_x10 / 10, g_fps_x10 % 10,
+                                  g_run_avg_us / 1000, (g_run_avg_us / 100) % 10,
+                                  g_run_max_us / 1000, (g_run_max_us / 100) % 10,
+                                  g_pres_avg_us / 1000, (g_pres_avg_us / 100) % 10,
+                                  g_pres_max_us / 1000, (g_pres_max_us / 100) % 10,
+                                  g_net_avg_us / 1000, (g_net_avg_us / 100) % 10,
+                                  g_net_max_us / 1000, (g_net_max_us / 100) % 10,
+                                  g_lag_pct);
             if (frame % 600 == 0)    sram_save();          // SRAM ~every 10s
             if (frame % 3600 == 0)   state_save("auto1");  // auto ~every 1 min
             if (frame % 36000 == 0)  state_save("auto10"); // auto ~every 10 min
         }
+        u64 pres_t0 = armGetSystemTick();
         present();
+        if (!g_menu_open)  // menu present() builds the whole menu — not the
+                            // display-path cost this metric exists to expose
+            pres_timing_tick((unsigned)(armTicksToNs(armGetSystemTick() - pres_t0) / 1000));
     }
 
     sram_save();            // final flush on exit
@@ -770,6 +1050,9 @@ int main(int argc, char **argv) {
     save_io_flush();        // these two must actually land before we exit
     retro_unload_game();
 cleanup:
+    if (g_net_initialized) net_upscale_exit();
+    free(g_luma_buf);
+    telemetry_exit();
     save_io_exit();
     audio_exit();
     retro_deinit();
